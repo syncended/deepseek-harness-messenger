@@ -1,4 +1,5 @@
 import type { Context } from '@deepseek-ai/cordis';
+import type {} from '@deepseek-ai/dsh-host-apiproxy';
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import {
   installSettingsSection,
@@ -17,7 +18,7 @@ export type {
 } from './types.js';
 
 export const name = 'messenger';
-export const inject = ['agents', 'credentials'];
+export const inject = ['agents', 'apiProxy', 'credentials', 'permissionPresets'];
 export const MESSENGER_SETTINGS_NAMESPACE = settingsNamespace('messenger');
 
 export const TELEGRAM_BOT_TOKEN_REF = 'TELEGRAM_BOT_TOKEN';
@@ -72,9 +73,11 @@ async function startTelegramRuntime(
   }
 
   const outbound = new Set<Promise<void>>();
+  const sessionEventTails = new Map<string, Promise<void>>();
   let acceptingOutbound = true;
   let polling: Promise<void> = Promise.resolve();
   let disposeSessionEvents: (() => void) | undefined;
+  let bridge: MessengerBridge | undefined;
   let stopped = false;
 
   const stop = async (): Promise<void> => {
@@ -84,6 +87,7 @@ async function startTelegramRuntime(
     disposeSessionEvents?.();
     controller.abort(new Error('messenger Telegram runtime stopped'));
     await Promise.allSettled([polling, ...outbound]);
+    await bridge?.dispose();
   };
 
   const tokenRef = credentialRef(TELEGRAM_BOT_TOKEN_REF);
@@ -103,6 +107,17 @@ async function startTelegramRuntime(
     pollTimeoutSeconds: config.pollTimeoutSeconds,
     requestTimeoutMs: config.requestTimeoutMs,
     signal: controller.signal,
+    onError: (error, retryDelayMs) => {
+      if (retryDelayMs === 0) {
+        ctx.logger.warn('messenger: Telegram update handler failed: %o', error);
+      } else {
+        ctx.logger.warn(
+          'messenger: Telegram operation failed; retrying in %d ms: %o',
+          retryDelayMs,
+          error,
+        );
+      }
+    },
   });
 
   try {
@@ -114,7 +129,7 @@ async function startTelegramRuntime(
     throw error;
   }
 
-  const bridge = new MessengerBridge(ctx, {
+  bridge = new MessengerBridge(ctx, {
     allowedChatIds: config.allowedChatIds,
     allowedUserIds: config.allowedUserIds,
     privateChatsOnly: config.privateChatsOnly,
@@ -123,15 +138,23 @@ async function startTelegramRuntime(
 
   disposeSessionEvents = ctx.on('session/event', (session, event) => {
     if (!acceptingOutbound) return;
-    const task = bridge.onSessionEvent(String(session.id), event);
+    const sessionId = String(session.id);
+    const previous = sessionEventTails.get(sessionId) ?? Promise.resolve();
+    const task = previous
+      .catch(() => undefined)
+      .then(() => bridge.onSessionEvent(sessionId, event));
+    sessionEventTails.set(sessionId, task);
     outbound.add(task);
     void task
       .catch((error: unknown) => {
         if (!controller.signal.aborted) {
-          ctx.logger.warn('messenger: failed to mirror assistant message: %o', error);
+          ctx.logger.warn('messenger: failed to mirror session event: %o', error);
         }
       })
-      .finally(() => outbound.delete(task));
+      .finally(() => {
+        outbound.delete(task);
+        if (sessionEventTails.get(sessionId) === task) sessionEventTails.delete(sessionId);
+      });
   });
 
   polling = adapter
