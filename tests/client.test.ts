@@ -126,6 +126,114 @@ describe('Messenger Web settings helpers', () => {
     await scope.dispose();
   });
 
+  it('serializes proxy reloads and writes so revisions cannot regress', async () => {
+    const telegram = testing.telegramValue(undefined);
+    let resolveDescribe!: (value: unknown) => void;
+    let mutateCalled = false;
+    const api = {
+      settings: {
+        describe() {
+          return new Promise((resolve) => {
+            resolveDescribe = resolve;
+          });
+        },
+        async mutate() {
+          mutateCalled = true;
+          return { result: { ok: true, value: {
+            ns: 'messenger', schema: {}, value: { telegram: { ...telegram, enabled: true } },
+            applies: 'live', secrets: [], revision: 5,
+          } } };
+        },
+      },
+    };
+    const scope = testing.createDirectSettingsScope(api);
+    const reload = scope.reload();
+    const write = scope.set('telegram', { ...telegram, enabled: true });
+    await Promise.resolve();
+    expect(mutateCalled).toBe(false);
+    resolveDescribe({ result: { ok: true, value: {
+      writable: true,
+      hasDocument: true,
+      namespaces: [{
+        ns: 'messenger', schema: {}, value: { telegram },
+        applies: 'live', secrets: [], revision: 4,
+      }],
+    } } });
+    await reload;
+    await write;
+    expect(scope.getSnapshot()).toMatchObject({ revision: 5 });
+    await scope.dispose();
+  });
+
+  it('refreshes a proxy scope after a rejected stale write', async () => {
+    const telegram = testing.telegramValue(undefined);
+    let reads = 0;
+    const api = {
+      settings: {
+        async describe() {
+          reads += 1;
+          return { result: { ok: true, value: {
+            writable: true,
+            hasDocument: true,
+            namespaces: [{
+              ns: 'messenger', schema: {}, value: { telegram },
+              applies: 'live', secrets: [], revision: reads === 1 ? 4 : 6,
+            }],
+          } } };
+        },
+        async mutate() {
+          return { result: { ok: false, error: { message: 'settings revision conflict' } } };
+        },
+      },
+    };
+    const scope = testing.createDirectSettingsScope(api);
+    await scope.reload();
+    await expect(scope.set('telegram', telegram)).rejects.toThrow('settings revision conflict');
+    expect(scope.getSnapshot()).toMatchObject({ status: 'ready', revision: 6 });
+    await scope.dispose();
+  });
+
+  it('waits for an in-flight proxy write during disposal', async () => {
+    const telegram = testing.telegramValue(undefined);
+    let resolveMutation!: (value: unknown) => void;
+    const api = {
+      settings: {
+        async describe() {
+          return { result: { ok: true, value: {
+            writable: true,
+            hasDocument: true,
+            namespaces: [{
+              ns: 'messenger', schema: {}, value: { telegram },
+              applies: 'live', secrets: [], revision: 1,
+            }],
+          } } };
+        },
+        mutate() {
+          return new Promise((resolve) => {
+            resolveMutation = resolve;
+          });
+        },
+      },
+    };
+    const scope = testing.createDirectSettingsScope(api);
+    await scope.reload();
+    const write = scope.set('telegram', telegram);
+    await Promise.resolve();
+    let disposed = false;
+    const disposal = scope.dispose().then(() => {
+      disposed = true;
+    });
+    await Promise.resolve();
+    expect(disposed).toBe(false);
+    resolveMutation({ result: { ok: true, value: {
+      ns: 'messenger', schema: {}, value: { telegram },
+      applies: 'live', secrets: [], revision: 2,
+    } } });
+    await write;
+    await disposal;
+    expect(disposed).toBe(true);
+  });
+
   it('uses secure Telegram defaults', () => {
     expect(testing.telegramValue(undefined)).toMatchObject({
       enabled: false,
