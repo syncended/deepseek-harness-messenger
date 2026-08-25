@@ -65,7 +65,7 @@ The package exports [`cordis.patch.yml`](./cordis.patch.yml) as its DSH bundle a
 5. Keep **Allow private chats only** enabled unless group access is required.
 6. Save, then send `/sessions` to the bot and bind it with `/use <session-id>`.
 
-Settings changes apply live. A bot token can also come from the `TELEGRAM_BOT_TOKEN` environment variable; environment-provided credentials are intentionally read-only in the Web page.
+Settings changes apply live. Local reverse-proxy origins under the reserved `.localhost` suffix (for example, `https://dsh.localhost`) are supported; requests still pass through the DSH Host API trust fence. A bot token can also come from the `TELEGRAM_BOT_TOKEN` environment variable; environment-provided credentials are intentionally read-only in the Web page.
 
 ### Configure manually
 

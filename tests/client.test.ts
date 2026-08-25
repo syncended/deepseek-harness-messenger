@@ -8,6 +8,14 @@ interface ClientDefinition {
       splitIds(value: string): string[];
       telegramValue(section: unknown): Record<string, unknown>;
       messengerNamespace(describe: unknown): unknown;
+      isLocalhostProxy(hostname: unknown): boolean;
+      createDirectSettingsScope(api: any): {
+        getSnapshot(): Record<string, any>;
+        subscribe(listener: () => void): () => void;
+        reload(): Promise<void>;
+        set(field: string, value: unknown): Promise<void>;
+        dispose(): Promise<void>;
+      };
       sameTelegram(
         left: Record<string, any>,
         right: Record<string, any>,
@@ -60,6 +68,62 @@ describe('Messenger Web settings helpers', () => {
       namespaces: [{ ns: 'shell' }, messenger],
     })).toBe(messenger);
     expect(testing.messengerNamespace({ namespaces: [] })).toBeUndefined();
+  });
+
+  it('recognizes only reserved localhost subdomains as local proxies', () => {
+    expect(testing.isLocalhostProxy('dsh.localhost')).toBe(true);
+    expect(testing.isLocalhostProxy('DSHR.LOCALHOST')).toBe(true);
+    expect(testing.isLocalhostProxy('localhost')).toBe(false);
+    expect(testing.isLocalhostProxy('dsh.localhost.example.com')).toBe(false);
+  });
+
+  it('reads and revision-fences settings through a localhost proxy', async () => {
+    const telegram = testing.telegramValue(undefined);
+    let mutation: any;
+    const namespace = (revision: number, enabled = false) => ({
+      ns: 'messenger',
+      schema: {},
+      value: { telegram: { ...telegram, enabled } },
+      base: { telegram },
+      applies: 'live',
+      secrets: [],
+      revision,
+    });
+    const api = {
+      settings: {
+        async describe() {
+          return { result: { ok: true, value: {
+            writable: true,
+            hasDocument: true,
+            namespaces: [namespace(4)],
+          } } };
+        },
+        async mutate(request: unknown) {
+          mutation = request;
+          return { result: { ok: true, value: namespace(5, true) } };
+        },
+      },
+    };
+    const scope = testing.createDirectSettingsScope(api);
+    await scope.reload();
+    expect(scope.getSnapshot()).toMatchObject({
+      status: 'ready',
+      revision: 4,
+      writable: true,
+      mode: 'host',
+    });
+    await scope.set('telegram', { ...telegram, enabled: true });
+    expect(mutation).toMatchObject({
+      ns: 'messenger',
+      expectedRevision: 4,
+      ops: [{ op: 'set', path: ['telegram'] }],
+    });
+    expect(scope.getSnapshot()).toMatchObject({
+      status: 'ready',
+      revision: 5,
+      value: { telegram: { enabled: true } },
+    });
+    await scope.dispose();
   });
 
   it('uses secure Telegram defaults', () => {
