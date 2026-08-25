@@ -1,6 +1,6 @@
 {
   "name": "@syncended/dsh-messenger",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Messenger bridge plugin for DeepSeek Harness, starting with Telegram",
   "type": "module",
   "main": "dist/index.js",

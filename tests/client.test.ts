@@ -70,6 +70,9 @@ describe('Messenger Web settings helpers', () => {
     expect(CLIENT_SOURCE).not.toContain('--dsw-alias-bg-primary');
     expect(CLIENT_SOURCE).not.toContain('--dsw-alias-text-primary');
     expect(CLIENT_SOURCE).not.toContain('--dsw-alias-border-default');
+    expect(CLIENT_SOURCE).not.toContain('--dsw-alias-fill-l2');
+    expect(CLIENT_SOURCE).not.toContain('--dsw-font-mono');
+    expect(CLIENT_SOURCE).toContain('--ds-font-family-code');
   });
 
   it('finds the Messenger namespace in a fresh Host description', () => {
