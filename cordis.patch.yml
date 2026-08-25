@@ -1,12 +1,11 @@
 - insert:
     - id: messenger
-      name: deepseek-harness-messenger
+      name: '@syncended/dsh-messenger'
       config:
         telegram:
-          enabled: true
+          enabled: false
           tokenRef: TELEGRAM_BOT_TOKEN
-          allowedChatIds:
-            - '123456789'
+          allowedChatIds: []
           allowedUserIds: []
           privateChatsOnly: true
           pollTimeoutSeconds: 30

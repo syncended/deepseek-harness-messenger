@@ -1,5 +1,5 @@
 {
-  "name": "deepseek-harness-messenger",
+  "name": "@syncended/dsh-messenger",
   "version": "0.1.0",
   "description": "Messenger bridge plugin for DeepSeek Harness, starting with Telegram",
   "type": "module",
@@ -10,19 +10,28 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
+    "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
     "dist",
+    "cordis.patch.yml",
     "README.md",
     "LICENSE"
   ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "check": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "clean": "rm -rf dist"
+    "check": "pnpm typecheck && pnpm test && pnpm build",
+    "clean": "rm -rf dist",
+    "prepare": "pnpm build"
   },
   "keywords": [
     "deepseek",

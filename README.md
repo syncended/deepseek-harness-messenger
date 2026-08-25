@@ -38,41 +38,41 @@ pnpm test
 pnpm build
 ```
 
-Install the plugin into a DSH web profile from a local checkout:
+Install the published package into a DSH web profile:
+
+```bash
+dsh plugin --profile web add @syncended/dsh-messenger
+```
+
+For local development, install it from a checkout instead:
 
 ```bash
 dsh plugin --profile web add /absolute/path/to/deepseek-harness-messenger
 ```
 
-Or install it directly from GitHub:
-
-```bash
-dsh plugin --profile web add github:syncended/deepseek-harness-messenger
-```
-
 ## DSH configuration
 
-Add the entry from [`cordis.patch.example.yml`](./cordis.patch.example.yml) to your profile patch and provide the allowed Telegram chat IDs:
+The package exports [`cordis.patch.yml`](./cordis.patch.yml) as its DSH bundle. The bundled entry is disabled by default so installation never starts a bot before credentials and access controls are configured.
+
+Enable the existing `messenger` entry in your profile patch and provide the allowed Telegram chat IDs:
 
 ```yaml
-- insert:
-    - id: messenger
-      name: deepseek-harness-messenger
-      config:
-        telegram:
-          enabled: true
-          tokenRef: TELEGRAM_BOT_TOKEN
-          allowedChatIds:
-            - '123456789'
-          allowedUserIds: []
-          privateChatsOnly: true
-          pollTimeoutSeconds: 30
-          requestTimeoutMs: 15000
+- id: messenger
+  config:
+    telegram:
+      enabled: true
+      tokenRef: TELEGRAM_BOT_TOKEN
+      allowedChatIds:
+        - '123456789'
+      allowedUserIds: []
+      privateChatsOnly: true
+      pollTimeoutSeconds: 30
+      requestTimeoutMs: 15000
 ```
 
 The token is never stored in the plugin configuration. `tokenRef` is the name of a DSH credential reference. It defaults to `TELEGRAM_BOT_TOKEN`; its value can be stored in the managed DSH credential store or supplied through an environment variable with the same name.
 
-> **Important:** when `allowedChatIds` is empty, the plugin starts but ignores every incoming Telegram message. This is the secure default. Group chats are disabled by default; to enable them, set `privateChatsOnly: false` and explicitly list authorized operators in `allowedUserIds`.
+> **Important:** the adapter is disabled by default. When it is enabled with an empty `allowedChatIds`, the plugin ignores every incoming Telegram message. Group chats are also disabled by default; to enable them, set `privateChatsOnly: false` and explicitly list authorized operators in `allowedUserIds`.
 
 ## Architecture
 

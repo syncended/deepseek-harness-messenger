@@ -29,7 +29,7 @@ export interface Config {
 
 export const Config: z<Config> = z.object({
   telegram: z.object({
-    enabled: z.boolean().default(true),
+    enabled: z.boolean().default(false),
     tokenRef: z.string().default('TELEGRAM_BOT_TOKEN'),
     allowedChatIds: z.array(z.string()).default([]),
     allowedUserIds: z.array(z.string()).default([]),
