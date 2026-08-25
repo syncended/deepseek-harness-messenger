@@ -1,35 +1,35 @@
 # DeepSeek Harness Messenger
 
-Плагин-мост между [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) и мессенджерами. Базовый транспорт — Telegram Bot API; архитектура рассчитана на добавление Яндекс Мессенджера, Discord и других адаптеров.
+A bridge plugin between [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) and messaging platforms. Telegram Bot API is the initial transport, while the architecture is designed to support Yandex Messenger, Discord, and additional adapters.
 
-## Что уже есть
+## Current features
 
-- подключение Telegram-бота через credential reference DSH;
-- allowlist Telegram chat ID — неизвестные чаты игнорируются;
-- привязка Telegram-чата к живой DSH-сессии;
-- отправка follow-up и steering сообщений в Harness;
-- отмена активного turn из Telegram;
-- зеркалирование текстовых `assistant/message` событий обратно в Telegram;
-- разбиение длинных ответов по лимиту Telegram;
-- общий интерфейс `MessengerAdapter` для следующих транспортов.
+- Telegram bot connectivity through a DSH credential reference;
+- Telegram chat ID allowlist with unknown chats ignored;
+- binding a Telegram chat to a live DSH session;
+- sending follow-up and steering messages to Harness;
+- canceling an active turn from Telegram;
+- mirroring text from `assistant/message` events back to Telegram;
+- splitting long responses to respect Telegram limits;
+- a shared `MessengerAdapter` interface for future transports.
 
-## Команды бота
+## Bot commands
 
-| Команда | Действие |
+| Command | Action |
 | --- | --- |
-| `/sessions` | Показать живые корневые DSH-чаты |
-| `/use <session-id>` | Привязать текущий Telegram-чат к DSH-чату |
-| `/status` | Показать текущую привязку и статус агента |
-| `/steer <text>` | Отправить steering в активный turn |
-| `/cancel` | Запросить отмену активного turn |
-| `/unbind` | Удалить привязку |
-| `/help` | Показать справку |
+| `/sessions` | List live top-level DSH chats |
+| `/use <session-id>` | Bind the current Telegram chat to a DSH chat |
+| `/status` | Show the current binding and agent status |
+| `/steer <text>` | Send steering to the active turn |
+| `/cancel` | Request cancellation of the active turn |
+| `/unbind` | Remove the current binding |
+| `/help` | Show command help |
 
-Обычный текст отправляется как отдельный follow-up в привязанный DSH-чат.
+Any other text is sent as a separate follow-up to the bound DSH chat.
 
-## Установка для разработки
+## Development setup
 
-Требуются Node.js 22+ и pnpm 10.
+Node.js 22+ and pnpm 10 are required.
 
 ```bash
 pnpm install
@@ -38,21 +38,21 @@ pnpm test
 pnpm build
 ```
 
-Установка плагина в web-профиль DSH из локального checkout:
+Install the plugin into a DSH web profile from a local checkout:
 
 ```bash
 dsh plugin --profile web add /absolute/path/to/deepseek-harness-messenger
 ```
 
-Или после публикации GitHub-репозитория:
+Or install it directly from GitHub:
 
 ```bash
 dsh plugin --profile web add github:syncended/deepseek-harness-messenger
 ```
 
-## Конфигурация DSH
+## DSH configuration
 
-Добавьте entry из [`cordis.patch.example.yml`](./cordis.patch.example.yml) в patch вашего профиля и укажите разрешённые Telegram chat ID:
+Add the entry from [`cordis.patch.example.yml`](./cordis.patch.example.yml) to your profile patch and provide the allowed Telegram chat IDs:
 
 ```yaml
 - insert:
@@ -70,11 +70,11 @@ dsh plugin --profile web add github:syncended/deepseek-harness-messenger
           requestTimeoutMs: 15000
 ```
 
-Токен не хранится в конфигурации плагина. `tokenRef` — имя credential reference в DSH. По умолчанию это `TELEGRAM_BOT_TOKEN`; значение можно сохранить в managed credential store DSH или передать через переменную окружения с тем же именем.
+The token is never stored in the plugin configuration. `tokenRef` is the name of a DSH credential reference. It defaults to `TELEGRAM_BOT_TOKEN`; its value can be stored in the managed DSH credential store or supplied through an environment variable with the same name.
 
-> **Важно:** при пустом `allowedChatIds` плагин запускается, но игнорирует все входящие Telegram-сообщения. Это безопасное поведение по умолчанию. Групповые чаты по умолчанию запрещены; чтобы включить их, задайте `privateChatsOnly: false` и обязательно перечислите управляющих пользователей в `allowedUserIds`.
+> **Important:** when `allowedChatIds` is empty, the plugin starts but ignores every incoming Telegram message. This is the secure default. Group chats are disabled by default; to enable them, set `privateChatsOnly: false` and explicitly list authorized operators in `allowedUserIds`.
 
-## Архитектура
+## Architecture
 
 ```text
 TelegramAdapter ─┐
@@ -83,24 +83,24 @@ DiscordAdapter ──┘          ^                  |
                             └─ session/event ──┘
 ```
 
-- адаптер отвечает только за протокол конкретного мессенджера;
-- `MessengerBridge` отвечает за команды, allowlist, привязки и маршрутизацию;
-- входящие сообщения создаются через `createUserMessage()` с источником `plugin: messenger`;
-- исходящие ответы читаются из durable `assistant/message` событий DSH.
+- An adapter is responsible only for its messaging platform protocol.
+- `MessengerBridge` owns commands, allowlists, bindings, and routing.
+- Incoming messages are created through `createUserMessage()` with the `plugin: messenger` source.
+- Outgoing responses are read from durable DSH `assistant/message` events.
 
-Привязки пока process-local и сбрасываются при перезапуске плагина.
+Bindings are currently process-local and reset when the plugin restarts.
 
 ## Roadmap
 
-- сохранение привязок в DSH settings/storage;
-- onboarding и управление токенами из Web GUI;
-- создание и возобновление DSH-сессий прямо из мессенджера;
-- потоковое редактирование ответа во время генерации;
-- вложения, изображения и файлы;
-- адаптер Яндекс Мессенджера;
-- адаптер Discord;
-- роли и granular access control для групповых чатов.
+- Persist bindings through DSH settings or storage.
+- Add onboarding and token management to the Web GUI.
+- Create and resume DSH sessions directly from a messenger.
+- Edit streamed responses while generation is in progress.
+- Support attachments, images, and files.
+- Add a Yandex Messenger adapter.
+- Add a Discord adapter.
+- Add roles and granular access control for group chats.
 
-## Лицензия
+## License
 
 MIT
