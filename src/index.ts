@@ -1,5 +1,9 @@
 import type { Context } from '@deepseek-ai/cordis';
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
+import {
+  installSettingsSection,
+  settingsNamespace,
+} from '@deepseek-ai/dsh-settings';
 import z from '@deepseek-ai/schemastery';
 import { MessengerBridge } from './bridge.js';
 import { TelegramAdapter } from './telegram.js';
@@ -14,81 +18,110 @@ export type {
 
 export const name = 'messenger';
 export const inject = ['agents', 'credentials'];
+export const MESSENGER_SETTINGS_NAMESPACE = settingsNamespace('messenger');
+
+export const TELEGRAM_BOT_TOKEN_REF = 'TELEGRAM_BOT_TOKEN';
+const TELEGRAM_BOT_TOKEN_PATTERN = /^\d{6,12}:[A-Za-z0-9_-]{30,}$/;
+const TELEGRAM_CHAT_ID_PATTERN = /^-?\d+$/;
+const TELEGRAM_USER_ID_PATTERN = /^\d+$/;
+
+export interface TelegramConfig {
+  enabled: boolean;
+  tokenRef: string;
+  allowedChatIds: string[];
+  allowedUserIds: string[];
+  privateChatsOnly: boolean;
+  pollTimeoutSeconds: number;
+  requestTimeoutMs: number;
+}
 
 export interface Config {
-  telegram: {
-    enabled: boolean;
-    tokenRef: string;
-    allowedChatIds: string[];
-    allowedUserIds: string[];
-    privateChatsOnly: boolean;
-    pollTimeoutSeconds: number;
-    requestTimeoutMs: number;
-  };
+  telegram: TelegramConfig;
 }
 
 export const Config: z<Config> = z.object({
   telegram: z.object({
     enabled: z.boolean().default(false),
-    tokenRef: z.string().default('TELEGRAM_BOT_TOKEN'),
-    allowedChatIds: z.array(z.string()).default([]),
-    allowedUserIds: z.array(z.string()).default([]),
+    tokenRef: z.string().default(TELEGRAM_BOT_TOKEN_REF),
+    allowedChatIds: z.array(
+      z.string().pattern(TELEGRAM_CHAT_ID_PATTERN),
+    ).default([]),
+    allowedUserIds: z.array(
+      z.string().pattern(TELEGRAM_USER_ID_PATTERN),
+    ).default([]),
     privateChatsOnly: z.boolean().default(true),
     pollTimeoutSeconds: z.number().min(1).max(50).default(30),
     requestTimeoutMs: z.number().min(1_000).max(120_000).default(15_000),
   }),
 });
 
-export async function apply(ctx: Context, config: Config): Promise<void> {
-  if (!config.telegram.enabled) {
-    ctx.logger.info('messenger: Telegram adapter is disabled');
-    return;
-  }
-  if (config.telegram.allowedChatIds.length === 0) {
+interface TelegramRuntime {
+  stop(): Promise<void>;
+}
+
+async function startTelegramRuntime(
+  ctx: Context,
+  config: TelegramConfig,
+  controller: AbortController,
+  beforeActivate: () => Promise<void>,
+): Promise<TelegramRuntime> {
+  if (config.allowedChatIds.length === 0) {
     ctx.logger.warn(
       'messenger: allowedChatIds is empty; all Telegram messages will be ignored',
     );
   }
 
-  const controller = new AbortController();
   const outbound = new Set<Promise<void>>();
   let acceptingOutbound = true;
   let polling: Promise<void> = Promise.resolve();
+  let disposeSessionEvents: (() => void) | undefined;
+  let stopped = false;
 
-  ctx.effect(
-    () => async () => {
-      acceptingOutbound = false;
-      controller.abort(new Error('messenger plugin disposed'));
-      await Promise.allSettled([polling, ...outbound]);
-    },
-    'messenger.telegram',
-  );
+  const stop = async (): Promise<void> => {
+    if (stopped) return;
+    stopped = true;
+    acceptingOutbound = false;
+    disposeSessionEvents?.();
+    controller.abort(new Error('messenger Telegram runtime stopped'));
+    await Promise.allSettled([polling, ...outbound]);
+  };
 
-  const tokenRef = credentialRef(config.telegram.tokenRef);
+  const tokenRef = credentialRef(TELEGRAM_BOT_TOKEN_REF);
   const adapter = new TelegramAdapter({
     token: async () => {
       const resolved = await ctx.credentials.resolve(tokenRef);
       if (resolved === undefined) {
         throw new Error(
-          `messenger: credential ${config.telegram.tokenRef} is not configured in DSH`,
+          `messenger: credential ${TELEGRAM_BOT_TOKEN_REF} is not configured in DSH`,
         );
+      }
+      if (!TELEGRAM_BOT_TOKEN_PATTERN.test(resolved.value)) {
+        throw new Error('messenger: configured Telegram credential is not a bot token');
       }
       return resolved.value;
     },
-    pollTimeoutSeconds: config.telegram.pollTimeoutSeconds,
-    requestTimeoutMs: config.telegram.requestTimeoutMs,
+    pollTimeoutSeconds: config.pollTimeoutSeconds,
+    requestTimeoutMs: config.requestTimeoutMs,
     signal: controller.signal,
   });
-  await adapter.validate(controller.signal);
+
+  try {
+    await adapter.validate(controller.signal);
+    await beforeActivate();
+    if (controller.signal.aborted) throw controller.signal.reason;
+  } catch (error) {
+    await stop();
+    throw error;
+  }
 
   const bridge = new MessengerBridge(ctx, {
-    allowedChatIds: config.telegram.allowedChatIds,
-    allowedUserIds: config.telegram.allowedUserIds,
-    privateChatsOnly: config.telegram.privateChatsOnly,
+    allowedChatIds: config.allowedChatIds,
+    allowedUserIds: config.allowedUserIds,
+    privateChatsOnly: config.privateChatsOnly,
   });
   bridge.registerAdapter(adapter);
 
-  ctx.on('session/event', (session, event) => {
+  disposeSessionEvents = ctx.on('session/event', (session, event) => {
     if (!acceptingOutbound) return;
     const task = bridge.onSessionEvent(String(session.id), event);
     outbound.add(task);
@@ -102,7 +135,15 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   });
 
   polling = adapter
-    .start((message) => bridge.handle(message), controller.signal)
+    .start(async (message) => {
+      try {
+        await bridge.handle(message);
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          ctx.logger.warn('messenger: Telegram message handling failed: %o', error);
+        }
+      }
+    }, controller.signal)
     .catch((error: unknown) => {
       if (!controller.signal.aborted) {
         ctx.logger.error('messenger: Telegram polling stopped: %o', error);
@@ -111,6 +152,131 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   ctx.logger.info(
     'messenger: Telegram adapter connected using credential %s',
-    config.telegram.tokenRef,
+    TELEGRAM_BOT_TOKEN_REF,
   );
+
+  return { stop };
+}
+
+export function validateMessengerConfig(config: Config): void {
+  const telegram = config.telegram;
+  if (telegram.tokenRef !== TELEGRAM_BOT_TOKEN_REF) {
+    throw new Error(`Telegram credential reference must be ${TELEGRAM_BOT_TOKEN_REF}`);
+  }
+  if (!Number.isInteger(telegram.pollTimeoutSeconds)) {
+    throw new Error('Telegram long-poll timeout must be an integer');
+  }
+  if (!Number.isInteger(telegram.requestTimeoutMs)) {
+    throw new Error('Telegram request timeout must be an integer');
+  }
+  if (telegram.enabled && telegram.allowedChatIds.length === 0) {
+    throw new Error('Telegram requires at least one allowed chat ID when enabled');
+  }
+  if (
+    telegram.enabled
+    && !telegram.privateChatsOnly
+    && telegram.allowedUserIds.length === 0
+  ) {
+    throw new Error('Telegram group access requires at least one allowed user ID');
+  }
+}
+
+export async function apply(ctx: Context, entryConfig: Config): Promise<void> {
+  let source = (): Config => entryConfig;
+  let active: TelegramRuntime | undefined;
+  let candidate: AbortController | undefined;
+  let disposed = false;
+  let generation = 0;
+  let tail: Promise<void> = Promise.resolve();
+
+  const reconcile = (): Promise<void> => {
+    const requestedGeneration = ++generation;
+    candidate?.abort(new Error('messenger configuration superseded'));
+
+    tail = tail.then(async () => {
+      if (disposed || requestedGeneration !== generation) return;
+
+      const current = source();
+      try {
+        validateMessengerConfig(current);
+      } catch (error) {
+        ctx.logger.error('messenger: configuration is invalid: %o', error);
+        return;
+      }
+      if (!current.telegram.enabled) {
+        await active?.stop();
+        active = undefined;
+        ctx.logger.info('messenger: Telegram adapter is disabled');
+        return;
+      }
+
+      const previous = active;
+      const controller = new AbortController();
+      candidate = controller;
+      try {
+        const next = await startTelegramRuntime(
+          ctx,
+          current.telegram,
+          controller,
+          async () => {
+            if (disposed || requestedGeneration !== generation) {
+              controller.abort(new Error('messenger configuration superseded'));
+              throw controller.signal.reason;
+            }
+            await previous?.stop();
+            if (active === previous) active = undefined;
+          },
+        );
+        if (disposed || requestedGeneration !== generation) {
+          await next.stop();
+          return;
+        }
+        active = next;
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          ctx.logger.error('messenger: Telegram adapter could not start: %o', error);
+        }
+      } finally {
+        if (candidate === controller) candidate = undefined;
+      }
+    });
+    return tail;
+  };
+
+  ctx.effect(
+    () => async () => {
+      disposed = true;
+      generation += 1;
+      candidate?.abort(new Error('messenger plugin disposed'));
+      await tail;
+      await active?.stop();
+      active = undefined;
+    },
+    'messenger.runtime',
+  );
+
+  let settingsScheduledReconcile = false;
+  installSettingsSection(
+    ctx,
+    MESSENGER_SETTINGS_NAMESPACE,
+    Config,
+    entryConfig,
+    {
+      setSource(current) {
+        source = current;
+      },
+      onChange() {
+        settingsScheduledReconcile = true;
+        void reconcile();
+      },
+      validate: validateMessengerConfig,
+    },
+  );
+
+  ctx.on('credentials/reference-updated', (ref) => {
+    if (String(ref) === TELEGRAM_BOT_TOKEN_REF) void reconcile();
+  });
+
+  if (settingsScheduledReconcile) await tail;
+  else await reconcile();
 }

@@ -92,6 +92,29 @@ function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const rejectForAbort = (): void => {
+      reject(signal.reason ?? new Error('Telegram operation aborted'));
+    };
+    if (signal.aborted) {
+      rejectForAbort();
+      return;
+    }
+    signal.addEventListener('abort', rejectForAbort, { once: true });
+    void promise.then(
+      (value) => {
+        signal.removeEventListener('abort', rejectForAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', rejectForAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 function senderName(user: TelegramUser | undefined): string | undefined {
   if (user === undefined) return undefined;
   if (user.username) return `@${user.username}`;
@@ -131,7 +154,24 @@ export class TelegramAdapter implements MessengerAdapter {
         );
         retryDelay = DEFAULT_RETRY_DELAY_MS;
 
-        for (const update of updates) {
+        for (const update of [...updates].sort(
+          (left, right) => left.update_id - right.update_id,
+        )) {
+          const nextOffset = update.update_id + 1;
+          // Confirm one update before executing any Harness side effect. This is
+          // intentionally at-most-once: the operator may need to resend after a
+          // crash, but prompts, steering, and cancellation are never replayed.
+          await this.call<TelegramUpdate[]>(
+            'getUpdates',
+            {
+              offset: nextOffset,
+              timeout: 0,
+              allowed_updates: ['message'],
+            },
+            signal,
+          );
+          offset = nextOffset;
+
           const message = update.message;
           if (message?.text !== undefined) {
             const name = senderName(message.from);
@@ -145,7 +185,6 @@ export class TelegramAdapter implements MessengerAdapter {
               text: message.text,
             });
           }
-          offset = update.update_id + 1;
         }
       } catch {
         if (signal.aborted) return;
@@ -169,9 +208,6 @@ export class TelegramAdapter implements MessengerAdapter {
     body: object,
     signal?: AbortSignal,
   ): Promise<T> {
-    const token = typeof this.options.token === 'string'
-      ? this.options.token
-      : await this.options.token();
     const timeoutMs = operation === 'getUpdates'
       ? this.options.pollTimeoutSeconds * 1_000 + this.options.requestTimeoutMs
       : this.options.requestTimeoutMs;
@@ -181,6 +217,10 @@ export class TelegramAdapter implements MessengerAdapter {
       AbortSignal.timeout(timeoutMs),
     ].filter((candidate): candidate is AbortSignal => candidate !== undefined);
     const requestSignal = AbortSignal.any(signals);
+    if (requestSignal.aborted) throw requestSignal.reason;
+    const token = typeof this.options.token === 'string'
+      ? this.options.token
+      : await raceWithAbort(this.options.token(), requestSignal);
 
     let response: Response;
     try {
