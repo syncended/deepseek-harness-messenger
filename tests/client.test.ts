@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
+const CLIENT_SOURCE = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+
 interface ClientDefinition {
   id: string;
   factory: (require: (id: string) => unknown) => {
@@ -31,8 +33,7 @@ interface ClientDefinition {
 
 function loadClientTesting() {
   let definition: ClientDefinition | undefined;
-  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
-  const execute = new Function('window', source);
+  const execute = new Function('window', CLIENT_SOURCE);
   execute({
     __ModuleLoader__: {
       load(value: ClientDefinition) {
@@ -60,6 +61,15 @@ describe('Messenger Web settings helpers', () => {
 
   it('normalizes and deduplicates ID lists', () => {
     expect(testing.splitIds('123, 456\n123')).toEqual(['123', '456']);
+  });
+
+  it('uses DSH theme tokens instead of fixed light-theme colors', () => {
+    expect(CLIENT_SOURCE).toContain('var(--dsw-alias-bg-layer-3)');
+    expect(CLIENT_SOURCE).toContain('var(--dsw-alias-label-primary)');
+    expect(CLIENT_SOURCE).toContain('var(--dsw-alias-border-l2)');
+    expect(CLIENT_SOURCE).not.toContain('--dsw-alias-bg-primary');
+    expect(CLIENT_SOURCE).not.toContain('--dsw-alias-text-primary');
+    expect(CLIENT_SOURCE).not.toContain('--dsw-alias-border-default');
   });
 
   it('finds the Messenger namespace in a fresh Host description', () => {
