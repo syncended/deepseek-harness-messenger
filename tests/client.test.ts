@@ -7,6 +7,7 @@ interface ClientDefinition {
     __testing: {
       splitIds(value: string): string[];
       telegramValue(section: unknown): Record<string, unknown>;
+      messengerNamespace(describe: unknown): unknown;
       sameTelegram(
         left: Record<string, any>,
         right: Record<string, any>,
@@ -51,6 +52,14 @@ describe('Messenger Web settings helpers', () => {
 
   it('normalizes and deduplicates ID lists', () => {
     expect(testing.splitIds('123, 456\n123')).toEqual(['123', '456']);
+  });
+
+  it('finds the Messenger namespace in a fresh Host description', () => {
+    const messenger = { ns: 'messenger', revision: 2 };
+    expect(testing.messengerNamespace({
+      namespaces: [{ ns: 'shell' }, messenger],
+    })).toBe(messenger);
+    expect(testing.messengerNamespace({ namespaces: [] })).toBeUndefined();
   });
 
   it('uses secure Telegram defaults', () => {
