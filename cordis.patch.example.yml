@@ -1,0 +1,13 @@
+- insert:
+    - id: messenger
+      name: deepseek-harness-messenger
+      config:
+        telegram:
+          enabled: true
+          tokenRef: TELEGRAM_BOT_TOKEN
+          allowedChatIds:
+            - '123456789'
+          allowedUserIds: []
+          privateChatsOnly: true
+          pollTimeoutSeconds: 30
+          requestTimeoutMs: 15000
