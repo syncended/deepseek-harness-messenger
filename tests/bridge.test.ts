@@ -115,17 +115,32 @@ function fakeContext() {
     }],
     failures: [],
   };
+  const workspaces = [{
+    workspaceId: 'workspace-1',
+    path: '/workspace/project',
+    title: 'Project',
+    sessionIds: ['session-1'],
+    createdAt: '2025-01-01T00:00:00.000Z',
+    updatedAt: '2025-01-01T00:00:00.000Z',
+  }];
+  let listed = [summary];
   const prompt = vi.fn(async () => ok({ accepted: true as const }));
   const sessions = {
-    list: vi.fn(async () => ok({ items: [summary] })),
+    list: vi.fn(async () => ok({ items: listed })),
     models: vi.fn(async () => ok(models)),
     history: vi.fn(async () => ok({ events: [], hasMore: false, projections: summary.projections })),
-    create: vi.fn(async () => ok({ sessionId: 'session-new' })),
+    create: vi.fn(async (input: { payload: { workspaceId?: string } }) => {
+      listed = [{ ...summary, sessionId: 'session-new' }];
+      return ok({ sessionId: 'session-new', workspaceId: input.payload.workspaceId });
+    }),
     prompt,
     cancel: vi.fn(async () => ok({ accepted: true as const })),
     selectModel: vi.fn(async (request: { payload: { provider: string; model: string; reasoningEffort?: string } }) => ok({
       selected: request.payload,
     })),
+  };
+  const workspace = {
+    list: vi.fn(async () => ok({ items: workspaces, archivedSessionIds: [] })),
   };
   const agent = {
     id: 'session-1',
@@ -137,7 +152,7 @@ function fakeContext() {
     agents: {
       get: vi.fn((id: string) => id === 'session-1' ? agent : undefined),
     },
-    apiProxy: { sessions },
+    apiProxy: { sessions, workspace },
     permissionPresets: {
       names: ['workspace-write'],
       defaultPreset: 'workspace-write',
@@ -146,13 +161,21 @@ function fakeContext() {
     },
     logger: { warn: vi.fn() },
   } as unknown as BridgeContext;
-  return { ctx, sessions, prompt, agent };
+  return { ctx, sessions, workspace, prompt, agent };
 }
 
 function firstCallback(adapter: FakeAdapter): string {
   const keyboard = adapter.sent.at(-1)?.options?.keyboard;
   const button = keyboard?.[0]?.[0];
   if (button === undefined || !('callbackData' in button)) throw new Error('callback button missing');
+  return button.callbackData;
+}
+
+function callbackFor(adapter: FakeAdapter, text: string): string {
+  const button = adapter.sent.at(-1)?.options?.keyboard
+    ?.flat()
+    .find((candidate) => candidate.text.includes(text));
+  if (button === undefined || !('callbackData' in button)) throw new Error(`callback button "${text}" missing`);
   return button.callbackData;
 }
 
@@ -187,6 +210,51 @@ describe('MessengerBridge controls', () => {
     expect(data).toMatch(/^m:[a-f0-9]{32}$/);
     expect(Buffer.byteLength(data)).toBeLessThanOrEqual(64);
     expect(data).not.toContain('session-1');
+  });
+
+  it('chooses a registered workspace before creating a session', async () => {
+    const { ctx, sessions, workspace } = fakeContext();
+    const adapter = new FakeAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    });
+    bridge.registerAdapter(adapter);
+
+    await bridge.handle(message('/new'));
+
+    expect(workspace.list).toHaveBeenCalledOnce();
+    expect(sessions.create).not.toHaveBeenCalled();
+    expect(adapter.sent.at(-1)?.text).toContain('Choose a workspace');
+    expect(callbackFor(adapter, 'Project')).toMatch(/^m:[a-f0-9]{32}$/);
+    expect(callbackFor(adapter, 'Host default')).toMatch(/^m:[a-f0-9]{32}$/);
+
+    await bridge.handle(callback(callbackFor(adapter, 'Project')));
+
+    expect(sessions.create).toHaveBeenCalledWith(expect.objectContaining({
+      payload: { workspaceId: 'workspace-1' },
+    }));
+    expect(adapter.sent.some((entry) => entry.text.startsWith('Created '))).toBe(true);
+    expect(adapter.sent.at(-1)?.text).toContain('Workspace: /workspace/project');
+  });
+
+  it('offers an explicit Host-default fallback when no workspace is registered', async () => {
+    const { ctx, sessions, workspace } = fakeContext();
+    workspace.list.mockResolvedValueOnce(ok({ items: [], archivedSessionIds: [] }));
+    const adapter = new FakeAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    });
+    bridge.registerAdapter(adapter);
+
+    await bridge.handle(message('/new'));
+
+    expect(adapter.sent.at(-1)?.text).toContain('No registered workspaces');
+    await bridge.handle(callback(callbackFor(adapter, 'Host default')));
+    expect(sessions.create).toHaveBeenCalledWith(expect.objectContaining({ payload: {} }));
   });
 
   it('answers callbacks before resuming and rejects a replay', async () => {

@@ -10,7 +10,7 @@ A bridge plugin between [DeepSeek Harness](https://github.com/deepseek-ai/deepse
 - private-chat and operator allowlists;
 - Telegram's native command menu and inline-button control panel;
 - listing and resuming persisted top-level DSH sessions;
-- creating a new DSH session without entering an opaque session ID;
+- choosing a registered DSH workspace when creating a new session;
 - model, reasoning-effort, and permission-preset selectors;
 - context pressure, composition, and cumulative token-usage visibility;
 - follow-up, steering, and turn cancellation controls;
@@ -28,7 +28,7 @@ Send `/start` or `/menu` to open the dashboard. Its buttons provide session, mod
 | `/menu` | Open the current-session dashboard |
 | `/sessions` | List recent persisted top-level DSH sessions |
 | `/resume [session-id]` | Choose a session with buttons, or resume the specified session |
-| `/new` | Create and bind a new session in the Host's default workspace |
+| `/new` | Choose a registered workspace (or the Host default directory), then create and bind a new session |
 | `/status` | Refresh the dashboard |
 | `/model` | Choose an advertised provider/model route |
 | `/reasoning` | Choose an effort advertised by the current model |
@@ -151,7 +151,6 @@ Bindings and callback actions are currently process-local and reset when the plu
 
 - Persist authorized bindings through DSH storage.
 - Add connection diagnostics and bot identity to the Web GUI.
-- Add workspace selection from a Host-approved alias list for new sessions.
 - Support attachments, images, and files.
 - Add Yandex Messenger and Discord adapters.
 - Add roles and more granular group-chat controls.

@@ -8,6 +8,7 @@ import type {
   SessionModels,
   SessionSummary,
 } from '@deepseek-ai/dsh-host-apiproxy/api/sessions';
+import type { WorkspaceId, WorkspaceView } from '@deepseek-ai/dsh-host-apiproxy/api/workspace';
 import type { PermissionPresetService } from '@deepseek-ai/dsh-permission-presets';
 import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session';
 
@@ -127,8 +128,15 @@ export class DshControl {
     return listed.items.filter((item) => item.origin !== 'subagent');
   }
 
-  async createSession(): Promise<string> {
-    const created = valueOf(await this.ctx.apiProxy.sessions.create(request({})));
+  async listWorkspaces(): Promise<WorkspaceView[]> {
+    const listed = valueOf(await this.ctx.apiProxy.workspace.list(request({})));
+    return listed.items;
+  }
+
+  async createSession(workspaceId?: WorkspaceId): Promise<string> {
+    const created = valueOf(await this.ctx.apiProxy.sessions.create(request(
+      workspaceId === undefined ? {} : { workspaceId },
+    )));
     return String(created.sessionId);
   }
 

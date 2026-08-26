@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Context } from '@deepseek-ai/cordis';
 import type { AgentRegistry } from '@deepseek-ai/dsh-agent';
 import type { ApiProxy } from '@deepseek-ai/dsh-host-apiproxy/api';
+import type { WorkspaceId } from '@deepseek-ai/dsh-host-apiproxy/api/workspace';
 import type { PermissionPresetService } from '@deepseek-ai/dsh-permission-presets';
 import type { SessionEvent } from '@deepseek-ai/dsh-session';
 import { DshControl, sessionTitle, visibleAssistantText } from './control.js';
@@ -18,6 +19,7 @@ import type {
 
 const CALLBACK_TTL_MS = 10 * 60_000;
 const SESSION_PAGE_SIZE = 7;
+const WORKSPACE_PAGE_SIZE = 7;
 const MAX_MODEL_BUTTONS = 24;
 const PROGRESS_EDIT_INTERVAL_MS = 750;
 const TYPING_REFRESH_MS = 4_000;
@@ -41,6 +43,8 @@ type CallbackAction =
   | { readonly kind: 'sessions'; readonly page: number }
   | { readonly kind: 'bind'; readonly sessionId: string }
   | { readonly kind: 'new' }
+  | { readonly kind: 'workspaces'; readonly page: number }
+  | { readonly kind: 'create'; readonly workspaceId?: WorkspaceId }
   | { readonly kind: 'models'; readonly sessionId: string }
   | { readonly kind: 'select-model'; readonly sessionId: string; readonly provider: string; readonly model: string }
   | { readonly kind: 'reasoning'; readonly sessionId: string }
@@ -97,6 +101,11 @@ function shortId(sessionId: string): string {
   return sessionId.length <= 10 ? sessionId : `…${sessionId.slice(-8)}`;
 }
 
+function truncateLabel(value: string, limit: number): string {
+  const characters = Array.from(value);
+  return characters.length <= limit ? value : `${characters.slice(0, limit - 1).join('')}…`;
+}
+
 function compactNumber(value: number | undefined): string {
   if (value === undefined) return '—';
   return new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(value);
@@ -115,7 +124,7 @@ function helpText(): string {
     '',
     '/menu — open the control panel',
     '/sessions or /resume — choose a persisted session',
-    '/new — create and bind a new session',
+    '/new — choose a workspace, then create and bind a new session',
     '/status — show the current session dashboard',
     '/model — choose provider and model',
     '/reasoning — choose reasoning effort',
@@ -437,7 +446,13 @@ export class MessengerBridge {
         await this.bindSession(adapter, chatId, senderId, action.sessionId);
         return;
       case 'new':
-        await this.createSession(adapter, chatId, senderId);
+        await this.showWorkspaces(adapter, chatId, senderId, 0);
+        return;
+      case 'workspaces':
+        await this.showWorkspaces(adapter, chatId, senderId, action.page);
+        return;
+      case 'create':
+        await this.createSession(adapter, chatId, senderId, action.workspaceId);
         return;
       case 'models':
         await this.showModels(adapter, chatId, senderId, action.sessionId);
@@ -513,7 +528,7 @@ export class MessengerBridge {
           }
           return;
         case 'new':
-          await this.createSession(adapter, chatId, senderId);
+          await this.showWorkspaces(adapter, chatId, senderId, 0);
           return;
         case 'model':
           await this.showModels(adapter, chatId, senderId);
@@ -617,13 +632,65 @@ export class MessengerBridge {
     await this.showDashboard(adapter, chatId, senderId);
   }
 
+  private async showWorkspaces(
+    adapter: MessengerAdapter,
+    chatId: string,
+    senderId: string,
+    requestedPage: number,
+  ): Promise<void> {
+    const workspaces = await this.control.listWorkspaces();
+    const pages = Math.max(1, Math.ceil(workspaces.length / WORKSPACE_PAGE_SIZE));
+    const page = Math.max(0, Math.min(requestedPage, pages - 1));
+    const rows = workspaces
+      .slice(page * WORKSPACE_PAGE_SIZE, (page + 1) * WORKSPACE_PAGE_SIZE)
+      .map((workspace) => [this.button(
+        adapter.id,
+        chatId,
+        senderId,
+        truncateLabel(`🗂 ${workspace.title} · ${workspace.path}`, 60),
+        { kind: 'create', workspaceId: workspace.workspaceId },
+      )]);
+    const navigation: { text: string; callbackData: string }[] = [];
+    if (page > 0) navigation.push(this.button(
+      adapter.id,
+      chatId,
+      senderId,
+      '‹ Previous',
+      { kind: 'workspaces', page: page - 1 },
+    ));
+    if (page + 1 < pages) navigation.push(this.button(
+      adapter.id,
+      chatId,
+      senderId,
+      'Next ›',
+      { kind: 'workspaces', page: page + 1 },
+    ));
+    if (navigation.length > 0) rows.push(navigation);
+    rows.push([this.button(
+      adapter.id,
+      chatId,
+      senderId,
+      'Host default working directory',
+      { kind: 'create' },
+    )]);
+    rows.push([this.button(adapter.id, chatId, senderId, 'Cancel', { kind: 'menu' })]);
+    await adapter.sendText(
+      chatId,
+      workspaces.length === 0
+        ? 'No registered workspaces. Create the session in the Host default working directory?'
+        : `Choose a workspace for the new session · page ${page + 1}/${pages}`,
+      { keyboard: callbackKeyboard(rows) },
+    );
+  }
+
   private async createSession(
     adapter: MessengerAdapter,
     chatId: string,
     senderId: string,
+    workspaceId?: WorkspaceId,
   ): Promise<void> {
     await adapter.sendTyping(chatId);
-    const sessionId = await this.control.createSession();
+    const sessionId = await this.control.createSession(workspaceId);
     const key = bindingKey(adapter.id, chatId);
     this.bindings.set(key, sessionId);
     this.bindingOperators.set(key, senderId);
