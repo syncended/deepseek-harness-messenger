@@ -1,5 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-host-apiproxy';
+import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api';
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import {
   installSettingsSection,
@@ -60,6 +62,62 @@ interface TelegramRuntime {
   stop(): Promise<void>;
 }
 
+function questionReconnectDelay(delayMs: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(finish, delayMs);
+    timer.unref?.();
+    signal.addEventListener('abort', finish, { once: true });
+    function finish(): void {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', finish);
+      resolve();
+    }
+  });
+}
+
+export async function mirrorQuestionEvents(
+  ctx: Context,
+  bridge: MessengerBridge,
+  signal: AbortSignal,
+): Promise<void> {
+  let retryDelayMs = 250;
+  while (!signal.aborted) {
+    try {
+      const stream = ctx.apiProxy.events.mux({
+        rpcId: RpcId(`messenger-events-${randomUUID()}`),
+        payload: {},
+      }, signal);
+      for await (const frame of stream) {
+        retryDelayMs = 250;
+        const event = frame.payload;
+        if (event.type === 'stream/error') {
+          throw new Error(`Messenger event stream failed: ${event.error.message}`);
+        }
+        try {
+          if (event.type === 'question/requested') {
+            await bridge.onQuestionRequested(frame.rpcId, String(event.sessionId), event.questions);
+          } else if (event.type === 'question/resolved') {
+            await bridge.onQuestionResolved(event.questionRpcId, event.outcome);
+          }
+        } catch (error) {
+          ctx.logger.warn('messenger: failed to mirror user question: %o', error);
+        }
+      }
+      if (!signal.aborted) throw new Error('Messenger event stream ended unexpectedly');
+    } catch (error) {
+      if (signal.aborted) return;
+      ctx.logger.warn(
+        'messenger: question event stream disconnected; reconnecting in %d ms: %o',
+        retryDelayMs,
+        error,
+      );
+      await questionReconnectDelay(retryDelayMs, signal);
+      retryDelayMs = Math.min(retryDelayMs * 2, 5_000);
+    }
+  }
+}
+
 async function startTelegramRuntime(
   ctx: Context,
   config: TelegramConfig,
@@ -76,6 +134,7 @@ async function startTelegramRuntime(
   const sessionEventTails = new Map<string, Promise<void>>();
   let acceptingOutbound = true;
   let polling: Promise<void> = Promise.resolve();
+  let questionEvents: Promise<void> = Promise.resolve();
   let disposeSessionEvents: (() => void) | undefined;
   let bridge: MessengerBridge | undefined;
   let stopped = false;
@@ -86,7 +145,7 @@ async function startTelegramRuntime(
     acceptingOutbound = false;
     disposeSessionEvents?.();
     controller.abort(new Error('messenger Telegram runtime stopped'));
-    await Promise.allSettled([polling, ...outbound]);
+    await Promise.allSettled([polling, questionEvents, ...outbound]);
     await bridge?.dispose();
   };
 
@@ -135,6 +194,11 @@ async function startTelegramRuntime(
     privateChatsOnly: config.privateChatsOnly,
   });
   bridge.registerAdapter(adapter);
+  questionEvents = mirrorQuestionEvents(ctx, bridge, controller.signal).catch((error: unknown) => {
+    if (!controller.signal.aborted) {
+      ctx.logger.error('messenger: Telegram question event stream stopped: %o', error);
+    }
+  });
 
   disposeSessionEvents = ctx.on('session/event', (session, event) => {
     if (!acceptingOutbound) return;

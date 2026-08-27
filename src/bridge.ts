@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Context } from '@deepseek-ai/cordis';
 import type { AgentRegistry } from '@deepseek-ai/dsh-agent';
-import type { ApiProxy } from '@deepseek-ai/dsh-host-apiproxy/api';
+import type { ApiProxy, MuxFrame, RpcId } from '@deepseek-ai/dsh-host-apiproxy/api';
 import type { WorkspaceId } from '@deepseek-ai/dsh-host-apiproxy/api/workspace';
 import type { PermissionPresetService } from '@deepseek-ai/dsh-permission-presets';
 import type { SessionEvent } from '@deepseek-ai/dsh-session';
@@ -18,12 +18,13 @@ import type {
 } from './types.js';
 
 const CALLBACK_TTL_MS = 10 * 60_000;
+const QUESTION_CALLBACK_TTL_MS = 24 * 60 * 60_000;
 const SESSION_PAGE_SIZE = 7;
 const WORKSPACE_PAGE_SIZE = 7;
-const MAX_MODEL_BUTTONS = 24;
+const MODEL_PAGE_SIZE = 8;
 const PROGRESS_EDIT_INTERVAL_MS = 750;
 const TYPING_REFRESH_MS = 4_000;
-const TELEGRAM_PROGRESS_LIMIT = 4_096;
+const DEFAULT_PROGRESS_LIMIT = 4_096;
 
 export type BridgeContext = {
   readonly agents: AgentRegistry;
@@ -46,8 +47,12 @@ type CallbackAction =
   | { readonly kind: 'workspaces'; readonly page: number }
   | { readonly kind: 'create'; readonly workspaceId?: WorkspaceId }
   | { readonly kind: 'models'; readonly sessionId: string }
+  | { readonly kind: 'provider-models'; readonly sessionId: string; readonly provider: string; readonly page: number }
   | { readonly kind: 'select-model'; readonly sessionId: string; readonly provider: string; readonly model: string }
   | { readonly kind: 'reasoning'; readonly sessionId: string }
+  | { readonly kind: 'question-select'; readonly sessionId: string; readonly questionRpcId: string; readonly questionId: string; readonly label: string }
+  | { readonly kind: 'question-toggle'; readonly sessionId: string; readonly questionRpcId: string; readonly questionId: string; readonly label: string }
+  | { readonly kind: 'question-submit'; readonly sessionId: string; readonly questionRpcId: string; readonly questionId: string }
   | { readonly kind: 'select-reasoning'; readonly sessionId: string; readonly effort?: string }
   | { readonly kind: 'permission'; readonly sessionId: string }
   | { readonly kind: 'select-permission'; readonly sessionId: string; readonly preset: string }
@@ -62,6 +67,38 @@ interface CallbackRecord {
   readonly bindingRevision: number;
   readonly expiresAt: number;
   readonly action: CallbackAction;
+}
+
+type QuestionItem = Extract<MuxFrame, { type: 'question/requested' }>['questions'][number];
+
+interface QuestionAnswerItem {
+  readonly id: string;
+  readonly selected: string[];
+  readonly custom?: string;
+}
+
+interface PendingQuestionRequest {
+  readonly rpcId: RpcId;
+  readonly sessionId: string;
+  readonly questions: readonly QuestionItem[];
+}
+
+interface PendingQuestionState extends PendingQuestionRequest {
+  readonly key: string;
+  readonly adapter: MessengerAdapter;
+  readonly chatId: string;
+  readonly senderId: string;
+  index: number;
+  readonly answers: QuestionAnswerItem[];
+  readonly selected: Set<string>;
+  readonly callbackTokens: Set<string>;
+  handle?: MessengerMessageHandle;
+}
+
+interface QuestionRetryState {
+  readonly rpcId: string;
+  readonly timer: ReturnType<typeof setTimeout>;
+  readonly delayMs: number;
 }
 
 interface ProgressState {
@@ -118,6 +155,19 @@ function contextLabel(projected: number | undefined, window: number | undefined)
   return `${compactNumber(projected)}/${compactNumber(window)}${percentage === undefined ? '' : ` (${percentage}%)`}`;
 }
 
+function stateTag(state: 'running' | 'idle' | 'dormant'): string {
+  if (state === 'running') return '🟢 running';
+  if (state === 'idle') return '⚪ idle';
+  return '💤 dormant';
+}
+
+function permissionTag(permission: string): string {
+  if (permission === 'danger-full-access') return '🔓 full access';
+  if (permission === 'workspace-write') return '✏️ workspace';
+  if (permission === 'read-only') return '👁 read only';
+  return `🛡 ${permission.replaceAll('-', ' ')}`;
+}
+
 function helpText(): string {
   return [
     'DeepSeek Harness messenger controls',
@@ -142,8 +192,12 @@ function helpText(): string {
 function actionSessionId(action: CallbackAction): string | undefined {
   switch (action.kind) {
     case 'models':
+    case 'provider-models':
     case 'select-model':
     case 'reasoning':
+    case 'question-select':
+    case 'question-toggle':
+    case 'question-submit':
     case 'select-reasoning':
     case 'permission':
     case 'select-permission':
@@ -168,14 +222,18 @@ function safeToolName(name: string): string {
 }
 
 function progressText(state: ProgressState): string {
-  const body = state.text.trim();
+  const rawBody = state.text.trim();
+  const body = rawBody && state.adapter.renderText !== undefined
+    ? state.adapter.renderText(rawBody)
+    : rawBody;
   const status = state.status.slice(-4).join('\n');
   const rendered = [body || (state.turnEnded ? 'Finished.' : 'Deep diving…'), status]
     .filter(Boolean)
     .join('\n\n');
   const characters = Array.from(rendered);
-  if (characters.length <= TELEGRAM_PROGRESS_LIMIT) return rendered;
-  return `…\n${characters.slice(-(TELEGRAM_PROGRESS_LIMIT - 2)).join('')}`;
+  const limit = state.adapter.textLimit ?? DEFAULT_PROGRESS_LIMIT;
+  if (characters.length <= limit) return rendered;
+  return `…\n${characters.slice(-(limit - 2)).join('')}`;
 }
 
 export class MessengerBridge {
@@ -190,6 +248,11 @@ export class MessengerBridge {
   private readonly actionQueues = new Map<string, Promise<unknown>>();
   private readonly callbacks = new Map<string, CallbackRecord>();
   private readonly progress = new Map<string, ProgressState>();
+  private readonly questionRequests = new Map<string, PendingQuestionRequest>();
+  private readonly pendingQuestions = new Map<string, PendingQuestionState>();
+  private readonly questionRetries = new Map<string, QuestionRetryState>();
+  private readonly questionRetryDelays = new Map<string, number>();
+  private readonly resolvingQuestions = new Set<string>();
   private readonly control: DshControl;
   private disposed = false;
 
@@ -233,10 +296,16 @@ export class MessengerBridge {
       return;
     }
 
-    await this.enqueueAction(
-      bindingKey(adapter.id, message.chatId),
-      () => this.handleTextMessage(adapter, message),
-    );
+    const key = bindingKey(adapter.id, message.chatId);
+    if (parseCommand(message.text) === undefined && !this.bindings.has(key)) {
+      await adapter.sendText(
+        message.chatId,
+        'No session selected. Use /resume to choose one or /new to create one.',
+        { keyboard: this.mainKeyboard(adapter.id, message.chatId, message.senderId) },
+      );
+      return;
+    }
+    await this.enqueueAction(key, () => this.handleTextMessage(adapter, message));
   }
 
   private async handleTextMessage(
@@ -249,7 +318,21 @@ export class MessengerBridge {
       return;
     }
 
-    const sessionId = this.bindings.get(bindingKey(message.transport, message.chatId));
+    const key = bindingKey(message.transport, message.chatId);
+    const pendingQuestion = this.pendingQuestions.get(key);
+    if (pendingQuestion !== undefined) {
+      try {
+        await this.answerQuestionWithText(pendingQuestion, message.text);
+      } catch (error) {
+        await adapter.sendText(
+          message.chatId,
+          `Could not submit that answer: ${this.errorMessage(error)}. Please try again.`,
+        );
+      }
+      return;
+    }
+
+    const sessionId = this.bindings.get(key);
     if (sessionId === undefined) {
       await adapter.sendText(
         message.chatId,
@@ -348,12 +431,133 @@ export class MessengerBridge {
     }
   }
 
+  async onQuestionRequested(
+    rpcId: RpcId,
+    sessionId: string,
+    questions: readonly QuestionItem[],
+  ): Promise<void> {
+    if (this.disposed || questions.length === 0) return;
+    const rpcKey = String(rpcId);
+    const request = this.questionRequests.get(rpcKey) ?? { rpcId, sessionId, questions };
+    this.questionRequests.set(rpcKey, request);
+
+    const progress = this.progressStates(sessionId);
+    for (const state of progress) {
+      this.stopTyping(state);
+      if (!state.status.includes('❓ Waiting for your answer')) {
+        state.status.push('❓ Waiting for your answer');
+      }
+    }
+    const flushed = await Promise.allSettled(progress.map((state) => this.flushProgress(state)));
+    for (const result of flushed) {
+      if (result.status === 'rejected') {
+        this.ctx.logger.warn('messenger: failed to pause progress for user question: %o', result.reason);
+      }
+    }
+
+    const starts: Promise<unknown>[] = [];
+    for (const [key, boundSessionId] of this.bindings) {
+      if (boundSessionId !== sessionId) continue;
+      starts.push(this.enqueueAction(key, () => this.startQuestionForBinding(key, request)));
+    }
+    const started = await Promise.allSettled(starts);
+    for (const result of started) {
+      if (result.status === 'rejected') {
+        this.ctx.logger.warn('messenger: failed to show user question: %o', result.reason);
+      }
+    }
+  }
+
+  async onQuestionResolved(
+    questionRpcId: RpcId | string,
+    outcome: 'answered' | 'cancelled' = 'answered',
+  ): Promise<void> {
+    const rpcId = String(questionRpcId);
+    this.resolvingQuestions.add(rpcId);
+    try {
+      const keys = [...this.pendingQuestions.values()]
+        .filter((state) => String(state.rpcId) === rpcId)
+        .map((state) => state.key);
+      await Promise.allSettled(keys.map((key) => this.enqueueAction(key, async () => undefined)));
+      await this.settleQuestion(
+        rpcId,
+        outcome,
+        outcome === 'answered' ? '✅ Question resolved.' : '⏹ Question cancelled.',
+      );
+    } finally {
+      this.resolvingQuestions.delete(rpcId);
+    }
+  }
+
+  private async settleQuestion(
+    rpcId: string,
+    outcome: 'answered' | 'cancelled',
+    resolvedText: string,
+  ): Promise<boolean> {
+    const request = this.questionRequests.get(rpcId);
+    const resolvedStates: PendingQuestionState[] = [];
+    for (const state of this.pendingQuestions.values()) {
+      if (String(state.rpcId) === rpcId) resolvedStates.push(state);
+    }
+    if (request === undefined && resolvedStates.length === 0) return false;
+
+    this.questionRequests.delete(rpcId);
+    this.clearQuestionRetriesForRpc(rpcId);
+    for (const state of resolvedStates) {
+      this.clearQuestionCallbacks(state);
+      this.pendingQuestions.delete(state.key);
+    }
+    const sessionId = request?.sessionId ?? resolvedStates[0]?.sessionId;
+    const stillPending = sessionId !== undefined && [...this.questionRequests.values()].some(
+      (candidate) => candidate.sessionId === sessionId,
+    );
+
+    await Promise.allSettled(resolvedStates.map((state) => (
+      state.handle === undefined
+        ? Promise.resolve()
+        : state.adapter.editText(state.chatId, state.handle.messageId, resolvedText, [])
+    )));
+
+    if (sessionId !== undefined) {
+      const progress = this.progressStates(sessionId);
+      for (const state of progress) {
+        const waiting = state.status.lastIndexOf('❓ Waiting for your answer');
+        if (!stillPending && waiting >= 0) state.status.splice(waiting, 1);
+        if (!stillPending) {
+          state.status.push(outcome === 'answered' ? '✅ Answered' : '⏹ Question cancelled');
+          if (!state.turnEnded && outcome === 'answered') this.startTyping(state);
+        }
+      }
+      this.scheduleProgressEdits(progress);
+    }
+
+    const promotions = resolvedStates.map(async (state) => {
+      const next = [...this.questionRequests.values()].find(
+        (candidate) => candidate.sessionId === state.sessionId,
+      );
+      if (next !== undefined) await this.startQuestionForBinding(state.key, next);
+    });
+    const promoted = await Promise.allSettled(promotions);
+    for (const result of promoted) {
+      if (result.status === 'rejected') {
+        this.ctx.logger.warn('messenger: failed to show queued user question: %o', result.reason);
+      }
+    }
+    return true;
+  }
+
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
     for (const state of this.progress.values()) this.stopProgressTimers(state);
     this.progress.clear();
     this.callbacks.clear();
+    this.questionRequests.clear();
+    this.pendingQuestions.clear();
+    for (const retry of this.questionRetries.values()) clearTimeout(retry.timer);
+    this.questionRetries.clear();
+    this.questionRetryDelays.clear();
+    this.resolvingQuestions.clear();
     await Promise.allSettled([
       ...this.actionQueues.values(),
       ...this.outboundQueues.values(),
@@ -363,7 +567,8 @@ export class MessengerBridge {
   private authorized(message: InboundMessengerMessage): boolean {
     if (!this.allowedChatIds.has(message.chatId)) return false;
     if (message.chatKind === 'private') return true;
-    return !this.privateChatsOnly && this.allowedUserIds.has(message.senderId);
+    const senderIds = message.senderAliases ?? [message.senderId];
+    return !this.privateChatsOnly && senderIds.some((id) => this.allowedUserIds.has(id));
   }
 
   private async handleCallback(
@@ -457,6 +662,16 @@ export class MessengerBridge {
       case 'models':
         await this.showModels(adapter, chatId, senderId, action.sessionId);
         return;
+      case 'provider-models':
+        await this.showProviderModels(
+          adapter,
+          chatId,
+          senderId,
+          action.sessionId,
+          action.provider,
+          action.page,
+        );
+        return;
       case 'select-model':
         await this.selectModel(adapter, chatId, senderId, action.sessionId, action.provider, action.model);
         return;
@@ -465,6 +680,15 @@ export class MessengerBridge {
         return;
       case 'select-reasoning':
         await this.selectReasoning(adapter, chatId, senderId, action.sessionId, action.effort);
+        return;
+      case 'question-select':
+        await this.selectQuestionOption(key, action.questionRpcId, action.questionId, action.label);
+        return;
+      case 'question-toggle':
+        await this.toggleQuestionOption(key, action.questionRpcId, action.questionId, action.label);
+        return;
+      case 'question-submit':
+        await this.submitQuestionSelection(key, action.questionRpcId, action.questionId);
         return;
       case 'permission':
         await this.showPermissions(adapter, chatId, senderId, action.sessionId);
@@ -546,6 +770,10 @@ export class MessengerBridge {
           const key = bindingKey(adapter.id, chatId);
           this.bindings.delete(key);
           this.bindingOperators.delete(key);
+          const pending = this.pendingQuestions.get(key);
+          if (pending !== undefined) this.clearQuestionCallbacks(pending);
+          this.pendingQuestions.delete(key);
+          this.clearQuestionRetry(key);
           this.bindingRevisions.set(key, (this.bindingRevisions.get(key) ?? 0) + 1);
           await adapter.sendText(chatId, 'Binding removed.', {
             keyboard: this.mainKeyboard(adapter.id, chatId, senderId),
@@ -573,6 +801,309 @@ export class MessengerBridge {
     }
   }
 
+  private async startQuestionForBinding(
+    key: string,
+    request: PendingQuestionRequest,
+  ): Promise<void> {
+    const existing = this.pendingQuestions.get(key);
+    if (existing !== undefined) return;
+    const rpcId = String(request.rpcId);
+    if (this.questionRequests.get(rpcId) !== request || this.resolvingQuestions.has(rpcId)) return;
+    const separator = key.indexOf(':');
+    const adapter = this.adapters.get(key.slice(0, separator));
+    const chatId = key.slice(separator + 1);
+    if (adapter === undefined || this.bindings.get(key) !== request.sessionId) return;
+    const state: PendingQuestionState = {
+      ...request,
+      key,
+      adapter,
+      chatId,
+      senderId: this.bindingOperators.get(key) ?? chatId,
+      index: 0,
+      answers: [],
+      selected: new Set(),
+      callbackTokens: new Set(),
+    };
+    try {
+      await this.renderQuestion(state);
+      this.pendingQuestions.set(key, state);
+      this.clearQuestionRetry(key);
+    } catch (error) {
+      this.clearQuestionCallbacks(state);
+      if (this.questionRequests.get(rpcId) === request) {
+        this.scheduleQuestionRetry(key, request);
+      }
+      throw error;
+    }
+  }
+
+  private clearQuestionRetry(key: string): void {
+    const retry = this.questionRetries.get(key);
+    if (retry !== undefined) clearTimeout(retry.timer);
+    this.questionRetries.delete(key);
+    this.questionRetryDelays.delete(key);
+  }
+
+  private scheduleQuestionRetry(key: string, request: PendingQuestionRequest): void {
+    const rpcId = String(request.rpcId);
+    const current = this.questionRetries.get(key);
+    if (current?.rpcId === rpcId) return;
+    if (current !== undefined) clearTimeout(current.timer);
+    const delayMs = this.questionRetryDelays.get(key) ?? 500;
+    const timer = setTimeout(() => {
+      this.questionRetries.delete(key);
+      if (
+        this.disposed
+        || this.questionRequests.get(rpcId) !== request
+        || this.pendingQuestions.has(key)
+        || this.bindings.get(key) !== request.sessionId
+      ) {
+        this.questionRetryDelays.delete(key);
+        return;
+      }
+      void this.enqueueAction(key, () => this.startQuestionForBinding(key, request))
+        .catch((error: unknown) => {
+          this.ctx.logger.warn('messenger: question retry failed: %o', error);
+        });
+    }, delayMs);
+    timer.unref?.();
+    this.questionRetries.set(key, { rpcId, timer, delayMs });
+    this.questionRetryDelays.set(key, Math.min(delayMs * 2, 5_000));
+  }
+
+  private clearQuestionRetriesForRpc(rpcId: string): void {
+    for (const [key, retry] of this.questionRetries) {
+      if (retry.rpcId !== rpcId) continue;
+      clearTimeout(retry.timer);
+      this.questionRetries.delete(key);
+      this.questionRetryDelays.delete(key);
+    }
+  }
+
+  private async renderQuestion(state: PendingQuestionState): Promise<void> {
+    const rpcId = String(state.rpcId);
+    if (this.resolvingQuestions.has(rpcId) || this.questionRequests.get(rpcId)?.rpcId !== state.rpcId) {
+      throw new Error('This question is no longer active.');
+    }
+    const question = state.questions[state.index];
+    if (question === undefined) return;
+    const options = question.options ?? [];
+    const heading = question.header?.trim() || `Question ${state.index + 1}/${state.questions.length}`;
+    const instructions = options.length === 0
+      ? 'Reply with your answer.'
+      : question.multiSelect === true
+        ? 'Select any number of options, then submit. You can also reply with custom text.'
+        : 'Choose one option, or reply with custom text.';
+    const optionDetails = options
+      .filter((option) => option.description?.trim())
+      .map((option) => `• ${option.label} — ${option.description!.trim()}`);
+    const text = [
+      `❓ ${heading}`,
+      '',
+      question.question,
+      ...(question.detail?.trim() ? ['', question.detail.trim()] : []),
+      ...(optionDetails.length === 0 ? [] : ['', ...optionDetails]),
+      '',
+      instructions,
+    ].join('\n');
+    const nextTokens = new Set<string>();
+    const questionButton = (buttonText: string, action: CallbackAction) => {
+      const button = this.button(
+        state.adapter.id,
+        state.chatId,
+        state.senderId,
+        buttonText,
+        action,
+        QUESTION_CALLBACK_TTL_MS,
+      );
+      nextTokens.add(button.callbackData.slice(2));
+      return button;
+    };
+    const rows = options.map((option) => [questionButton(
+      `${state.selected.has(option.label) ? '✓ ' : ''}${truncateLabel(option.label, 52)}`,
+      question.multiSelect === true
+        ? {
+            kind: 'question-toggle',
+            sessionId: state.sessionId,
+            questionRpcId: String(state.rpcId),
+            questionId: question.id,
+            label: option.label,
+          }
+        : {
+            kind: 'question-select',
+            sessionId: state.sessionId,
+            questionRpcId: String(state.rpcId),
+            questionId: question.id,
+            label: option.label,
+          },
+    )]);
+    if (question.multiSelect === true) rows.push([questionButton(
+      state.selected.size === 0 ? 'Submit without selection' : `Submit · ${state.selected.size} selected`,
+      {
+        kind: 'question-submit',
+        sessionId: state.sessionId,
+        questionRpcId: String(state.rpcId),
+        questionId: question.id,
+      },
+    )]);
+    rows.push([questionButton('Cancel turn', { kind: 'cancel', sessionId: state.sessionId })]);
+    const keyboard = callbackKeyboard(rows);
+    const renderedText = state.adapter.renderText?.(text) ?? text;
+    const editLimit = state.adapter.textLimit ?? DEFAULT_PROGRESS_LIMIT;
+    try {
+      if (state.handle === undefined || Array.from(renderedText).length > editLimit) {
+        state.handle = await state.adapter.sendText(state.chatId, renderedText, { keyboard });
+      } else {
+        await state.adapter.editText(state.chatId, state.handle.messageId, renderedText, keyboard);
+      }
+    } catch (error) {
+      for (const token of nextTokens) this.callbacks.delete(token);
+      throw error;
+    }
+    if (this.resolvingQuestions.has(rpcId) || this.questionRequests.get(rpcId)?.rpcId !== state.rpcId) {
+      for (const token of nextTokens) this.callbacks.delete(token);
+      throw new Error('This question is no longer active.');
+    }
+    for (const token of state.callbackTokens) this.callbacks.delete(token);
+    state.callbackTokens.clear();
+    for (const token of nextTokens) state.callbackTokens.add(token);
+  }
+
+  private clearQuestionCallbacks(state: PendingQuestionState): void {
+    for (const token of state.callbackTokens) this.callbacks.delete(token);
+    state.callbackTokens.clear();
+  }
+
+  private currentQuestion(
+    key: string,
+    questionRpcId: string,
+    questionId: string,
+  ): { state: PendingQuestionState; question: QuestionItem } {
+    const state = this.pendingQuestions.get(key);
+    const question = state?.questions[state.index];
+    if (
+      state === undefined
+      || this.resolvingQuestions.has(questionRpcId)
+      || String(state.rpcId) !== questionRpcId
+      || question === undefined
+      || question.id !== questionId
+    ) {
+      throw new Error('This question is no longer active.');
+    }
+    return { state, question };
+  }
+
+  private async selectQuestionOption(
+    key: string,
+    questionRpcId: string,
+    questionId: string,
+    label: string,
+  ): Promise<void> {
+    const { state, question } = this.currentQuestion(key, questionRpcId, questionId);
+    if (question.multiSelect === true || !(question.options ?? []).some((option) => option.label === label)) {
+      throw new Error('This option is no longer available.');
+    }
+    await this.advanceQuestion(state, { id: question.id, selected: [label] });
+  }
+
+  private async toggleQuestionOption(
+    key: string,
+    questionRpcId: string,
+    questionId: string,
+    label: string,
+  ): Promise<void> {
+    const { state, question } = this.currentQuestion(key, questionRpcId, questionId);
+    if (question.multiSelect !== true || !(question.options ?? []).some((option) => option.label === label)) {
+      throw new Error('This option is no longer available.');
+    }
+    const wasSelected = state.selected.has(label);
+    if (wasSelected) state.selected.delete(label);
+    else state.selected.add(label);
+    try {
+      await this.renderQuestion(state);
+    } catch (error) {
+      if (wasSelected) state.selected.add(label);
+      else state.selected.delete(label);
+      throw error;
+    }
+  }
+
+  private async submitQuestionSelection(
+    key: string,
+    questionRpcId: string,
+    questionId: string,
+  ): Promise<void> {
+    const { state, question } = this.currentQuestion(key, questionRpcId, questionId);
+    if (question.multiSelect !== true) throw new Error('This question is not multi-select.');
+    await this.advanceQuestion(state, { id: question.id, selected: [...state.selected] });
+  }
+
+  private async answerQuestionWithText(
+    state: PendingQuestionState,
+    text: string,
+  ): Promise<void> {
+    if (this.resolvingQuestions.has(String(state.rpcId))) {
+      await state.adapter.sendText(state.chatId, 'This question has already been resolved.');
+      return;
+    }
+    const custom = text.trim();
+    const question = state.questions[state.index];
+    if (question === undefined) return;
+    if (custom.length === 0) {
+      await state.adapter.sendText(state.chatId, 'Please send a non-empty answer.');
+      return;
+    }
+    await this.advanceQuestion(state, {
+      id: question.id,
+      selected: question.multiSelect === true ? [...state.selected] : [],
+      custom,
+    });
+  }
+
+  private async advanceQuestion(
+    state: PendingQuestionState,
+    answer: QuestionAnswerItem,
+  ): Promise<void> {
+    const answers = [...state.answers, answer];
+    if (state.index + 1 < state.questions.length) {
+      const previousIndex = state.index;
+      const previousSelected = [...state.selected];
+      state.answers.push(answer);
+      state.index += 1;
+      state.selected.clear();
+      try {
+        await this.renderQuestion(state);
+      } catch (error) {
+        state.answers.pop();
+        state.index = previousIndex;
+        state.selected.clear();
+        for (const label of previousSelected) state.selected.add(label);
+        throw error;
+      }
+      return;
+    }
+    let accepted: boolean;
+    try {
+      accepted = await this.control.answerQuestion(state.rpcId, state.sessionId, { answers });
+    } catch (error) {
+      await this.renderQuestion(state);
+      throw error;
+    }
+    const settled = await this.settleQuestion(
+      String(state.rpcId),
+      'answered',
+      accepted ? '✅ Answer submitted.' : '✅ Answered elsewhere.',
+    );
+    if (!settled && state.handle !== undefined) {
+      await state.adapter.editText(
+        state.chatId,
+        state.handle.messageId,
+        accepted ? '✅ Answer submitted.' : '✅ Answered elsewhere.',
+        [],
+      );
+    }
+  }
+
   private async showSessions(
     adapter: MessengerAdapter,
     chatId: string,
@@ -597,7 +1128,7 @@ export class MessengerBridge {
         adapter.id,
         chatId,
         senderId,
-        `${String(session.sessionId) === selected ? '✓' : session.running ? '🟢' : '⚪'} ${sessionTitle(session).slice(0, 40)} · ${shortId(String(session.sessionId))}`,
+        `${String(session.sessionId) === selected ? '✓' : session.running ? '🟢' : '⚪'} ${sessionTitle(session).slice(0, 52)}`,
         { kind: 'bind', sessionId: String(session.sessionId) },
       )]);
     const navigation: { text: string; callbackData: string }[] = [];
@@ -626,10 +1157,18 @@ export class MessengerBridge {
     // Reading the model directory uses the canonical resume path for dormant sessions.
     await this.control.models(sessionId);
     const key = bindingKey(adapter.id, chatId);
+    const previousQuestion = this.pendingQuestions.get(key);
+    if (previousQuestion !== undefined) this.clearQuestionCallbacks(previousQuestion);
+    this.pendingQuestions.delete(key);
+    this.clearQuestionRetry(key);
     this.bindings.set(key, sessionId);
     this.bindingOperators.set(key, senderId);
     this.bindingRevisions.set(key, (this.bindingRevisions.get(key) ?? 0) + 1);
     await this.showDashboard(adapter, chatId, senderId);
+    const pending = [...this.questionRequests.values()].find(
+      (request) => request.sessionId === sessionId,
+    );
+    if (pending !== undefined) await this.startQuestionForBinding(key, pending);
   }
 
   private async showWorkspaces(
@@ -716,14 +1255,20 @@ export class MessengerBridge {
     const snapshot = await this.control.snapshot(sessionId);
     const state = this.control.status(sessionId);
     const selection = snapshot.model.current;
+    const workspaceTitle = await this.control.workspaceTitle(snapshot.summary.cwd);
     const text = [
-      `${state === 'running' ? '🟢' : state === 'idle' ? '⚪' : '💤'} ${sessionTitle(snapshot.summary)} · ${shortId(sessionId)}`,
-      `State: ${state}`,
-      `Model: ${selection.provider}/${selection.model}`,
-      `Reasoning: ${selection.reasoningEffort ?? 'default'}`,
-      `Permission: ${snapshot.permission.current}`,
-      `Context: ${contextLabel(snapshot.context.projectedTokens ?? snapshot.context.pressureTokens, snapshot.context.contextWindow)}`,
-      ...(snapshot.summary.cwd ? [`Workspace: ${snapshot.summary.cwd}`] : []),
+      sessionTitle(snapshot.summary),
+      '',
+      [
+        stateTag(state),
+        permissionTag(snapshot.permission.current),
+        `🧠 ${contextLabel(
+          snapshot.context.projectedTokens ?? snapshot.context.pressureTokens,
+          snapshot.context.contextWindow,
+        )}`,
+      ].join('  •  '),
+      `${selection.provider}/${selection.model}  •  ${selection.reasoningEffort ?? 'default'}`,
+      ...(workspaceTitle === undefined ? [] : [`📁 ${workspaceTitle}`]),
     ].join('\n');
     const rows = [
       [
@@ -752,20 +1297,66 @@ export class MessengerBridge {
     sessionId = this.binding(adapter.id, chatId),
   ): Promise<void> {
     const directory = await this.control.models(sessionId);
-    const buttons = directory.groups.flatMap((group) => group.models.map((model) => ({ group, model })));
-    const rows = buttons.slice(0, MAX_MODEL_BUTTONS).map(({ group, model }) => [this.button(
+    const rows = directory.groups.map((group) => [this.button(
       adapter.id,
       chatId,
       senderId,
-      `${directory.current.provider === group.id && directory.current.model === model.id ? '✓ ' : ''}${group.name}: ${model.name}`.slice(0, 60),
-      { kind: 'select-model', sessionId, provider: group.id, model: model.id },
+      `${directory.current.provider === group.id ? '✓ ' : ''}${truncateLabel(group.name, 44)} · ${group.models.length}`,
+      { kind: 'provider-models', sessionId, provider: group.id, page: 0 },
     )]);
     rows.push([this.button(adapter.id, chatId, senderId, 'Back', { kind: 'menu' })]);
+    await adapter.sendText(chatId, [
+      'Choose a provider',
+      '',
+      `Current  ${directory.current.provider}/${directory.current.model}`,
+    ].join('\n'), { keyboard: callbackKeyboard(rows) });
+  }
+
+  private async showProviderModels(
+    adapter: MessengerAdapter,
+    chatId: string,
+    senderId: string,
+    sessionId: string,
+    provider: string,
+    requestedPage: number,
+  ): Promise<void> {
+    const directory = await this.control.models(sessionId);
+    const group = directory.groups.find((candidate) => candidate.id === provider);
+    if (group === undefined) throw new Error(`Provider ${provider} is no longer available.`);
+    const pages = Math.max(1, Math.ceil(group.models.length / MODEL_PAGE_SIZE));
+    const page = Math.max(0, Math.min(requestedPage, pages - 1));
+    const rows = group.models
+      .slice(page * MODEL_PAGE_SIZE, (page + 1) * MODEL_PAGE_SIZE)
+      .map((model) => [this.button(
+        adapter.id,
+        chatId,
+        senderId,
+        `${directory.current.provider === group.id && directory.current.model === model.id ? '✓ ' : ''}${truncateLabel(model.name, 50)}`,
+        { kind: 'select-model', sessionId, provider: group.id, model: model.id },
+      )]);
+    const navigation: { text: string; callbackData: string }[] = [];
+    if (page > 0) navigation.push(this.button(
+      adapter.id,
+      chatId,
+      senderId,
+      '‹ Previous',
+      { kind: 'provider-models', sessionId, provider, page: page - 1 },
+    ));
+    if (page + 1 < pages) navigation.push(this.button(
+      adapter.id,
+      chatId,
+      senderId,
+      'Next ›',
+      { kind: 'provider-models', sessionId, provider, page: page + 1 },
+    ));
+    if (navigation.length > 0) rows.push(navigation);
+    rows.push([
+      this.button(adapter.id, chatId, senderId, 'Providers', { kind: 'models', sessionId }),
+      this.button(adapter.id, chatId, senderId, 'Menu', { kind: 'menu' }),
+    ]);
     await adapter.sendText(
       chatId,
-      buttons.length > MAX_MODEL_BUTTONS
-        ? `Choose a model. Showing the first ${MAX_MODEL_BUTTONS} of ${buttons.length}.`
-        : 'Choose a model. The change applies to the next model step.',
+      `${group.name} · models · ${page + 1}/${pages}`,
       { keyboard: callbackKeyboard(rows) },
     );
   }
@@ -793,31 +1384,51 @@ export class MessengerBridge {
     const group = directory.groups.find((candidate) => candidate.id === directory.current.provider);
     const model = group?.models.find((candidate) => candidate.id === directory.current.model);
     const efforts = model?.reasoning?.efforts ?? [];
+    const modelIndex = group?.models.findIndex((candidate) => candidate.id === directory.current.model) ?? -1;
+    const modelPage = modelIndex < 0 ? 0 : Math.floor(modelIndex / MODEL_PAGE_SIZE);
+    const back = group === undefined
+      ? { kind: 'models' as const, sessionId }
+      : { kind: 'provider-models' as const, sessionId, provider: group.id, page: modelPage };
     if (efforts.length === 0) {
-      await adapter.sendText(chatId, 'This model does not advertise reasoning controls.', {
+      await adapter.sendText(chatId, [
+        `${directory.current.provider}/${directory.current.model}`,
+        '',
+        'This model uses its provider default reasoning mode.',
+      ].join('\n'), {
         keyboard: callbackKeyboard([[
-          this.button(adapter.id, chatId, senderId, 'Back', { kind: 'menu' }),
+          this.button(adapter.id, chatId, senderId, 'Models', back),
+          this.button(adapter.id, chatId, senderId, 'Menu', { kind: 'menu' }),
         ]]),
       });
       return;
     }
-    const rows = [[this.button(
+    const buttons = [this.button(
       adapter.id,
       chatId,
       senderId,
-      `${directory.current.reasoningEffort === undefined ? '✓ ' : ''}Provider default`,
+      `${directory.current.reasoningEffort === undefined ? '✓ ' : ''}Default`,
       { kind: 'select-reasoning', sessionId },
-    )], ...efforts.map((effort) => [this.button(
+    ), ...efforts.map((effort) => this.button(
       adapter.id,
       chatId,
       senderId,
-      `${directory.current.reasoningEffort === effort.id ? '✓ ' : ''}${effort.name}`,
+      `${directory.current.reasoningEffort === effort.id ? '✓ ' : ''}${truncateLabel(effort.name, 26)}`,
       { kind: 'select-reasoning', sessionId, effort: effort.id },
-    )])];
-    rows.push([this.button(adapter.id, chatId, senderId, 'Back', { kind: 'menu' })]);
-    await adapter.sendText(chatId, 'Choose reasoning effort. The change applies to the next model step.', {
-      keyboard: callbackKeyboard(rows),
-    });
+    ))];
+    const rows: { text: string; callbackData: string }[][] = [];
+    for (let index = 0; index < buttons.length; index += 2) {
+      rows.push(buttons.slice(index, index + 2));
+    }
+    rows.push([
+      this.button(adapter.id, chatId, senderId, 'Models', back),
+      this.button(adapter.id, chatId, senderId, 'Menu', { kind: 'menu' }),
+    ]);
+    await adapter.sendText(chatId, [
+      'Reasoning',
+      `${directory.current.provider}/${directory.current.model}`,
+      '',
+      `Current  •  ${directory.current.reasoningEffort ?? 'default'}`,
+    ].join('\n'), { keyboard: callbackKeyboard(rows) });
   }
 
   private async selectReasoning(
@@ -928,6 +1539,7 @@ export class MessengerBridge {
     senderId: string,
     text: string,
     action: CallbackAction,
+    ttlMs = CALLBACK_TTL_MS,
   ): { text: string; callbackData: string } {
     this.pruneCallbacks();
     const token = randomUUID().replaceAll('-', '');
@@ -936,7 +1548,7 @@ export class MessengerBridge {
       chatId,
       senderId,
       bindingRevision: this.bindingRevisions.get(bindingKey(transport, chatId)) ?? 0,
-      expiresAt: Date.now() + CALLBACK_TTL_MS,
+      expiresAt: Date.now() + ttlMs,
       action,
     });
     return { text, callbackData: `m:${token}` };
@@ -981,12 +1593,12 @@ export class MessengerBridge {
       turnEnded: false,
     };
     this.progress.set(key, state);
-    void adapter.sendTyping(chatId).catch((error: unknown) => this.logProgressError(error));
-    state.typingTimer = setInterval(() => {
-      void adapter.sendTyping(chatId).catch((error: unknown) => this.logProgressError(error));
-    }, TYPING_REFRESH_MS);
-    state.typingTimer.unref?.();
-    state.ready = adapter.sendText(chatId, 'Deep diving…', {
+    const waitingForAnswer = [...this.questionRequests.values()].some(
+      (request) => request.sessionId === sessionId,
+    );
+    if (waitingForAnswer) state.status.push('❓ Waiting for your answer');
+    else this.startTyping(state);
+    state.ready = adapter.sendText(chatId, waitingForAnswer ? 'Waiting for your answer…' : 'Deep diving…', {
       keyboard: callbackKeyboard([[
         this.button(adapter.id, chatId, senderId, 'Cancel', { kind: 'cancel', sessionId }),
       ]]),
@@ -1059,8 +1671,11 @@ export class MessengerBridge {
     this.stopProgressTimers(state);
     try {
       await state.ready;
-      const finalText = state.text.trim() || progressText(state);
-      const chunks = splitTelegramText(finalText);
+      const rawFinalText = state.text.trim();
+      const finalText = rawFinalText
+        ? state.adapter.renderText?.(rawFinalText) ?? rawFinalText
+        : progressText(state);
+      const chunks = state.adapter.splitText?.(finalText) ?? splitTelegramText(finalText);
       if (state.handle === undefined) {
         await state.adapter.sendText(state.chatId, finalText);
       } else {
@@ -1092,11 +1707,23 @@ export class MessengerBridge {
     await this.finalizeProgress(state);
   }
 
+  private startTyping(state: ProgressState): void {
+    if (state.typingTimer !== undefined || state.turnEnded) return;
+    void state.adapter.sendTyping(state.chatId).catch((error: unknown) => this.logProgressError(error));
+    state.typingTimer = setInterval(() => {
+      void state.adapter.sendTyping(state.chatId).catch((error: unknown) => this.logProgressError(error));
+    }, TYPING_REFRESH_MS);
+    state.typingTimer.unref?.();
+  }
+
+  private stopTyping(state: ProgressState): void {
+    if (state.typingTimer === undefined) return;
+    clearInterval(state.typingTimer);
+    state.typingTimer = undefined;
+  }
+
   private stopProgressTimers(state: ProgressState): void {
-    if (state.typingTimer !== undefined) {
-      clearInterval(state.typingTimer);
-      state.typingTimer = undefined;
-    }
+    this.stopTyping(state);
     if (state.editTimer !== undefined) {
       clearTimeout(state.editTimer);
       state.editTimer = undefined;
@@ -1111,7 +1738,10 @@ export class MessengerBridge {
       const adapter = this.adapters.get(key.slice(0, separator));
       if (adapter !== undefined) sends.push(this.enqueueOutbound(
         key,
-        () => adapter.sendText(key.slice(separator + 1), text),
+        () => adapter.sendText(
+          key.slice(separator + 1),
+          adapter.renderText?.(text) ?? text,
+        ),
       ));
     }
     await Promise.all(sends);
@@ -1141,7 +1771,7 @@ export class MessengerBridge {
   }
 
   private logProgressError(error: unknown): void {
-    this.ctx.logger.warn('messenger: progressive Telegram update failed: %o', error);
+    this.ctx.logger.warn('messenger: progressive transport update failed: %o', error);
   }
 
   private errorMessage(error: unknown): string {

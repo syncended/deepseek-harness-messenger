@@ -10,6 +10,8 @@ interface InboundMessengerBase {
   readonly chatId: string;
   readonly chatKind?: MessengerChatKind;
   readonly senderId: string;
+  /** Additional stable platform identifiers accepted by operator allowlists. */
+  readonly senderAliases?: readonly string[];
   readonly senderName?: string;
   /** Text supplied to existing command/message handlers. */
   readonly text: string;
@@ -60,6 +62,12 @@ export interface SendTextOptions {
 
 export interface MessengerAdapter {
   readonly id: string;
+  /** Maximum Unicode code points accepted by an edited text message. */
+  readonly textLimit?: number;
+  /** Convert common Markdown into the transport's supported rich-text dialect. */
+  renderText?(text: string): string;
+  /** Split text according to transport-specific message limits. */
+  splitText?(text: string): string[];
   start(
     onMessage: (message: InboundMessengerMessage) => Promise<void>,
     signal: AbortSignal,

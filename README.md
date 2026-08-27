@@ -11,7 +11,9 @@ A bridge plugin between [DeepSeek Harness](https://github.com/deepseek-ai/deepse
 - Telegram's native command menu and inline-button control panel;
 - listing and resuming persisted top-level DSH sessions;
 - choosing a registered DSH workspace when creating a new session;
-- model, reasoning-effort, and permission-preset selectors;
+- compact dashboards using DSH workspace display names without opaque session hashes;
+- provider-grouped, paginated model selection and compact reasoning controls;
+- interactive `ask_user_question` choices, multi-select, and free-text answers;
 - context pressure, composition, and cumulative token-usage visibility;
 - follow-up, steering, and turn cancellation controls;
 - immediate `Deep diving…` feedback, typing activity, streamed message edits, and redacted tool/checklist status;
@@ -42,6 +44,8 @@ Send `/start` or `/menu` to open the dashboard. Its buttons provide session, mod
 `/use <session-id>` remains as an alias for `/resume <session-id>`. Any other text is queued as a follow-up to the bound session.
 
 Telegram group commands addressed as `/command@bot_username` are accepted only when the suffix matches this bot's identity returned by `getMe`.
+
+When DSH calls `ask_user_question`, the bot pauses typing and shows the question with native option buttons. Single-select, multi-select, free-text answers, batched questions, cancellation, reconnect replay, and concurrent pending questions are supported.
 
 ## Progressive responses
 

@@ -1,6 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import type { AgentRegistry } from '@deepseek-ai/dsh-agent';
-import type { ApiProxy } from '@deepseek-ai/dsh-host-apiproxy/api';
+import type {
+  ApiProxy,
+  QuestionResponsePayload,
+  RpcId as RpcIdType,
+} from '@deepseek-ai/dsh-host-apiproxy/api';
 import { RpcId, type RpcResponse } from '@deepseek-ai/dsh-host-apiproxy/api/rpc';
 import type {
   ModelProviderGroup,
@@ -133,6 +137,19 @@ export class DshControl {
     return listed.items;
   }
 
+  async workspaceTitle(cwd: string | undefined): Promise<string | undefined> {
+    if (cwd === undefined) return undefined;
+    const stripped = cwd.replace(/[\\/]+$/, '');
+    const normalized = stripped || cwd;
+    const workspaces = await this.listWorkspaces();
+    const matched = workspaces.find((workspace) => {
+      const workspaceStripped = workspace.path.replace(/[\\/]+$/, '');
+      return (workspaceStripped || workspace.path) === normalized;
+    });
+    if (matched?.title.trim()) return matched.title.trim();
+    return normalized.split(/[\\/]/).pop() || normalized;
+  }
+
   async createSession(workspaceId?: WorkspaceId): Promise<string> {
     const created = valueOf(await this.ctx.apiProxy.sessions.create(request(
       workspaceId === undefined ? {} : { workspaceId },
@@ -198,6 +215,25 @@ export class DshControl {
     const agent = this.ctx.agents.get(SessionId(sessionId));
     if (agent === undefined) throw new Error(`Session ${sessionId} is not live.`);
     this.ctx.permissionPresets.set(agent.session, preset);
+  }
+
+  async answerQuestion(
+    rpcId: RpcIdType,
+    sessionId: string,
+    answer: QuestionResponsePayload['answer'],
+  ): Promise<boolean> {
+    const receipt = await this.ctx.apiProxy.respond({
+      type: 'client-response',
+      rpcId,
+      result: {
+        ok: true,
+        value: {
+          sessionId: SessionId(sessionId),
+          answer,
+        } satisfies QuestionResponsePayload,
+      },
+    });
+    return receipt.accepted;
   }
 
   async cancel(sessionId: string): Promise<boolean> {

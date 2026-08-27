@@ -9,6 +9,7 @@ import type {
   MessengerMessageHandle,
   SendTextOptions,
 } from '../src/types.js';
+import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api';
 import type { SessionEvent } from '@deepseek-ai/dsh-session';
 
 function ok<T>(value: T) {
@@ -148,11 +149,12 @@ function fakeContext() {
     session: { events: [] },
     cancel: vi.fn(),
   };
+  const respond = vi.fn(async (_request: unknown) => ({ accepted: true as const }));
   const ctx = {
     agents: {
       get: vi.fn((id: string) => id === 'session-1' ? agent : undefined),
     },
-    apiProxy: { sessions, workspace },
+    apiProxy: { sessions, workspace, respond },
     permissionPresets: {
       names: ['workspace-write'],
       defaultPreset: 'workspace-write',
@@ -161,7 +163,7 @@ function fakeContext() {
     },
     logger: { warn: vi.fn() },
   } as unknown as BridgeContext;
-  return { ctx, sessions, workspace, prompt, agent };
+  return { ctx, sessions, workspace, prompt, respond, agent };
 }
 
 function firstCallback(adapter: FakeAdapter): string {
@@ -175,6 +177,13 @@ function callbackFor(adapter: FakeAdapter, text: string): string {
   const button = adapter.sent.at(-1)?.options?.keyboard
     ?.flat()
     .find((candidate) => candidate.text.includes(text));
+  if (button === undefined || !('callbackData' in button)) throw new Error(`callback button "${text}" missing`);
+  return button.callbackData;
+}
+
+function latestCallbackFor(adapter: FakeAdapter, text: string): string {
+  const keyboard = adapter.edits.at(-1)?.keyboard ?? adapter.sent.at(-1)?.options?.keyboard;
+  const button = keyboard?.flat().find((candidate) => candidate.text.includes(text));
   if (button === undefined || !('callbackData' in button)) throw new Error(`callback button "${text}" missing`);
   return button.callbackData;
 }
@@ -207,6 +216,7 @@ describe('MessengerBridge controls', () => {
 
     expect(adapter.sent[0]?.text).toContain('Choose a session');
     const data = firstCallback(adapter);
+    expect(adapter.sent[0]?.options?.keyboard?.[0]?.[0]?.text).not.toContain('…');
     expect(data).toMatch(/^m:[a-f0-9]{32}$/);
     expect(Buffer.byteLength(data)).toBeLessThanOrEqual(64);
     expect(data).not.toContain('session-1');
@@ -236,7 +246,7 @@ describe('MessengerBridge controls', () => {
       payload: { workspaceId: 'workspace-1' },
     }));
     expect(adapter.sent.some((entry) => entry.text.startsWith('Created '))).toBe(true);
-    expect(adapter.sent.at(-1)?.text).toContain('Workspace: /workspace/project');
+    expect(adapter.sent.at(-1)?.text).toContain('📁 Project');
   });
 
   it('offers an explicit Host-default fallback when no workspace is registered', async () => {
@@ -299,6 +309,26 @@ describe('MessengerBridge controls', () => {
     expect(sessions.models).toHaveBeenCalled();
   });
 
+  it('accepts a group operator through a transport-provided sender alias', async () => {
+    const { ctx } = fakeContext();
+    const adapter = new FakeAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: ['operator-login'],
+      privateChatsOnly: false,
+    });
+    bridge.registerAdapter(adapter);
+
+    await bridge.handle({
+      ...message('/help'),
+      chatKind: 'group',
+      senderId: 'operator-uuid',
+      senderAliases: ['operator-uuid', 'operator-login'],
+    });
+
+    expect(adapter.sent.at(-1)?.text).toContain('DeepSeek Harness messenger controls');
+  });
+
   it('rejects callback tokens used by another sender', async () => {
     const { ctx } = fakeContext();
     const adapter = new FakeAdapter();
@@ -316,6 +346,324 @@ describe('MessengerBridge controls', () => {
     expect(adapter.answers.at(-1)?.text).toContain('another operator');
     await bridge.handle(callback(data, '100'));
     expect(adapter.answers.at(-1)?.text).toBeUndefined();
+  });
+
+  it('renders a compact dashboard with UI workspace title and no session hash', async () => {
+    const { ctx } = fakeContext();
+    const adapter = new FakeAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    });
+    bridge.registerAdapter(adapter);
+
+    await bridge.handle(message('/resume session-1'));
+
+    const dashboard = adapter.sent.at(-1)?.text ?? '';
+    expect(dashboard).toContain('Messenger work');
+    expect(dashboard).toContain('⚪ idle  •  ✏️ workspace');
+    expect(dashboard).toContain('deepseek/deepseek-chat  •  high');
+    expect(dashboard).toContain('📁 Project');
+    expect(dashboard).not.toContain('session-1');
+  });
+
+  it('groups model selection by provider before listing paginated models', async () => {
+    const { ctx } = fakeContext();
+    const adapter = new FakeAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    });
+    bridge.registerAdapter(adapter);
+    await bridge.handle(message('/resume session-1'));
+
+    await bridge.handle(message('/model'));
+    expect(adapter.sent.at(-1)?.text).toContain('Choose a provider');
+    expect(callbackFor(adapter, 'DeepSeek · 1')).toMatch(/^m:/);
+
+    await bridge.handle(callback(callbackFor(adapter, 'DeepSeek · 1')));
+    expect(adapter.sent.at(-1)?.text).toContain('DeepSeek · models · 1/1');
+    expect(callbackFor(adapter, 'DeepSeek Chat')).toMatch(/^m:/);
+  });
+
+  it('answers a single-select DSH question through apiProxy.respond', async () => {
+    const { ctx, respond } = fakeContext();
+    const adapter = new FakeAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    });
+    bridge.registerAdapter(adapter);
+    await bridge.handle(message('/resume session-1'));
+    await bridge.handle(message('start a turn'));
+
+    await bridge.onQuestionRequested(RpcId('question-rpc-1'), 'session-1', [{
+      id: 'deploy',
+      header: 'Confirm',
+      question: 'Deploy now?',
+      options: [
+        { label: 'Deploy', description: 'Ship it' },
+        { label: 'Wait' },
+      ],
+    }]);
+
+    expect(adapter.edits.some((entry) => entry.text.includes('Waiting for your answer'))).toBe(true);
+    expect(adapter.sent.at(-1)?.text).toContain('Deploy now?');
+    await bridge.handle(callback(callbackFor(adapter, 'Deploy')));
+
+    expect(respond).toHaveBeenCalledWith({
+      type: 'client-response',
+      rpcId: 'question-rpc-1',
+      result: {
+        ok: true,
+        value: {
+          sessionId: 'session-1',
+          answer: { answers: [{ id: 'deploy', selected: ['Deploy'] }] },
+        },
+      },
+    });
+    expect(adapter.edits.at(-1)?.text).toBe('✅ Answer submitted.');
+    await bridge.dispose();
+  });
+
+  it('retries showing a question after a transient transport failure', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ctx } = fakeContext();
+      const adapter = new FakeAdapter();
+      const bridge = new MessengerBridge(ctx, {
+        allowedChatIds: ['100'],
+        allowedUserIds: [],
+        privateChatsOnly: true,
+      });
+      bridge.registerAdapter(adapter);
+      await bridge.handle(message('/resume session-1'));
+      vi.spyOn(adapter, 'sendText').mockRejectedValueOnce(new Error('temporary send failure'));
+
+      await bridge.onQuestionRequested(RpcId('question-retry'), 'session-1', [{
+        id: 'retry',
+        question: 'Visible after retry?',
+      }]);
+      expect(adapter.sent.some((entry) => entry.text.includes('Visible after retry?'))).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(500);
+      await vi.waitFor(() => expect(
+        adapter.sent.some((entry) => entry.text.includes('Visible after retry?')),
+      ).toBe(true));
+      await bridge.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('queues concurrent question RPCs for one session without overwriting either', async () => {
+    const { ctx, respond } = fakeContext();
+    const adapter = new FakeAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    });
+    bridge.registerAdapter(adapter);
+    await bridge.handle(message('/resume session-1'));
+
+    await bridge.onQuestionRequested(RpcId('question-rpc-first'), 'session-1', [{
+      id: 'first',
+      question: 'First decision?',
+      options: [{ label: 'First answer' }],
+    }]);
+    await bridge.onQuestionRequested(RpcId('question-rpc-second'), 'session-1', [{
+      id: 'second',
+      question: 'Second decision?',
+      options: [{ label: 'Second answer' }],
+    }]);
+
+    expect(adapter.sent.at(-1)?.text).toContain('First decision?');
+    expect(adapter.sent.some((entry) => entry.text.includes('Second decision?'))).toBe(false);
+    await bridge.handle(callback(callbackFor(adapter, 'First answer')));
+
+    expect(adapter.sent.at(-1)?.text).toContain('Second decision?');
+    await bridge.handle(callback(callbackFor(adapter, 'Second answer')));
+    expect(respond.mock.calls.map(([request]) => (
+      request as { rpcId: string }
+    ).rpcId)).toEqual([
+      'question-rpc-first',
+      'question-rpc-second',
+    ]);
+    await bridge.dispose();
+  });
+
+  it('collects free text and multi-select answers across a question batch', async () => {
+    const { ctx, respond } = fakeContext();
+    const adapter = new FakeAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    });
+    bridge.registerAdapter(adapter);
+    await bridge.handle(message('/resume session-1'));
+
+    await bridge.onQuestionRequested(RpcId('question-rpc-2'), 'session-1', [{
+      id: 'name',
+      question: 'Release name?',
+    }, {
+      id: 'checks',
+      question: 'Which checks?',
+      multiSelect: true,
+      options: [{ label: 'Tests' }, { label: 'Lint' }],
+    }]);
+    await bridge.handle(message('August release'));
+    expect(adapter.edits.at(-1)?.text).toContain('Which checks?');
+
+    const staleSubmit = latestCallbackFor(adapter, 'Submit');
+    await bridge.handle(callback(latestCallbackFor(adapter, 'Tests')));
+    await bridge.handle(callback(staleSubmit));
+    expect(adapter.answers.at(-1)?.text).toContain('expired');
+    expect(respond).not.toHaveBeenCalled();
+    expect(adapter.edits.at(-1)?.keyboard?.flat().some(
+      (button) => button.text.includes('Submit · 1 selected'),
+    )).toBe(true);
+    await bridge.handle(callback(latestCallbackFor(adapter, 'Submit')));
+
+    expect(respond).toHaveBeenCalledWith(expect.objectContaining({
+      rpcId: 'question-rpc-2',
+      result: {
+        ok: true,
+        value: {
+          sessionId: 'session-1',
+          answer: { answers: [
+            { id: 'name', selected: [], custom: 'August release' },
+            { id: 'checks', selected: ['Tests'] },
+          ] },
+        },
+      },
+    }));
+    await bridge.dispose();
+  });
+
+  it('keeps the visible question active when rendering the next batch item fails', async () => {
+    const { ctx } = fakeContext();
+    const adapter = new FakeAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    });
+    bridge.registerAdapter(adapter);
+    await bridge.handle(message('/resume session-1'));
+    await bridge.onQuestionRequested(RpcId('question-render-retry'), 'session-1', [{
+      id: 'one',
+      question: 'Question one?',
+    }, {
+      id: 'two',
+      question: 'Question two?',
+    }]);
+    vi.spyOn(adapter, 'editText').mockRejectedValueOnce(new Error('temporary edit failure'));
+
+    await bridge.handle(message('first answer'));
+    expect(adapter.sent.at(-1)?.text).toContain('Could not submit that answer');
+    await bridge.handle(message('retry answer'));
+
+    expect(adapter.edits.at(-1)?.text).toContain('Question two?');
+    await bridge.dispose();
+  });
+
+  it('rolls back a multi-select toggle when keyboard rendering fails', async () => {
+    const { ctx, respond } = fakeContext();
+    const adapter = new FakeAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    });
+    bridge.registerAdapter(adapter);
+    await bridge.handle(message('/resume session-1'));
+    await bridge.onQuestionRequested(RpcId('question-toggle-rollback'), 'session-1', [{
+      id: 'checks',
+      question: 'Select checks',
+      multiSelect: true,
+      options: [{ label: 'Tests' }],
+    }]);
+    const submit = latestCallbackFor(adapter, 'Submit');
+    vi.spyOn(adapter, 'editText').mockRejectedValueOnce(new Error('temporary edit failure'));
+
+    await bridge.handle(callback(latestCallbackFor(adapter, 'Tests')));
+    await bridge.handle(callback(submit));
+
+    expect(respond).toHaveBeenCalledWith(expect.objectContaining({
+      result: expect.objectContaining({
+        value: expect.objectContaining({
+          answer: { answers: [{ id: 'checks', selected: [] }] },
+        }),
+      }),
+    }));
+    await bridge.dispose();
+  });
+
+  it('serializes external resolution behind an in-flight batch render', async () => {
+    const { ctx } = fakeContext();
+    const adapter = new FakeAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    });
+    bridge.registerAdapter(adapter);
+    await bridge.handle(message('/resume session-1'));
+    await bridge.onQuestionRequested(RpcId('question-resolution-race'), 'session-1', [{
+      id: 'one',
+      question: 'First?',
+    }, {
+      id: 'two',
+      question: 'Second?',
+    }]);
+    let release: (() => void) | undefined;
+    vi.spyOn(adapter, 'editText').mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    });
+
+    const answering = bridge.handle(message('answer'));
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    const resolving = bridge.onQuestionResolved('question-resolution-race', 'answered');
+    release?.();
+    await answering;
+    await resolving;
+
+    expect(adapter.edits.at(-1)?.text).toBe('✅ Question resolved.');
+    await bridge.dispose();
+  });
+
+  it('does not start typing when progress begins after a question is already pending', async () => {
+    const { ctx } = fakeContext();
+    const adapter = new FakeAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    });
+    bridge.registerAdapter(adapter);
+    await bridge.handle(message('/resume session-1'));
+    await bridge.onQuestionRequested(RpcId('question-before-progress'), 'session-1', [{
+      id: 'wait',
+      question: 'Wait for me?',
+    }]);
+
+    await bridge.onSessionEvent('session-1', {
+      type: 'turn/start',
+      seq: 1,
+      time: Date.now(),
+      data: { turn: 1 },
+    } as unknown as SessionEvent);
+
+    expect(adapter.typing).toBe(0);
+    expect(adapter.sent.at(-1)?.text).toBe('Waiting for your answer…');
+    await bridge.dispose();
   });
 
   it('rejects a session-scoped button after the binding changes', async () => {
@@ -410,6 +758,39 @@ describe('MessengerBridge controls', () => {
     await disposing;
 
     expect(sessions.create).not.toHaveBeenCalled();
+  });
+
+  it('uses transport-specific rich-text rendering for assistant messages', async () => {
+    const { ctx } = fakeContext();
+    const adapter = new FakeAdapter();
+    const renderText = vi.fn((text: string) => `rendered:${text}`);
+    Object.assign(adapter, { renderText });
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    });
+    bridge.registerAdapter(adapter);
+    await bridge.handle(message('/resume session-1'));
+
+    await bridge.onSessionEvent('session-1', {
+      type: 'assistant/message',
+      seq: 1,
+      time: Date.now(),
+      surfaceOp: 'append',
+      data: {
+        interrupted: false,
+        message: {
+          id: 'assistant-1',
+          role: 'assistant',
+          content: [{ type: 'text', text: '# Heading' }],
+        },
+      },
+    } as unknown as SessionEvent);
+
+    expect(renderText).toHaveBeenCalledWith('# Heading');
+    expect(adapter.sent.at(-1)?.text).toBe('rendered:# Heading');
+    await bridge.dispose();
   });
 
   it('drops a failed final-delivery state before the next turn', async () => {
