@@ -35,7 +35,7 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && node --check lib/client.js",
+    "build": "pnpm clean && tsc -p tsconfig.build.json && node --check lib/client.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
