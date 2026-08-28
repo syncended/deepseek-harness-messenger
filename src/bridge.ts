@@ -23,8 +23,29 @@ const SESSION_PAGE_SIZE = 7;
 const WORKSPACE_PAGE_SIZE = 7;
 const MODEL_PAGE_SIZE = 8;
 const PROGRESS_EDIT_INTERVAL_MS = 750;
+const PROGRESS_ANIMATION_INTERVAL_MS = 1_600;
 const TYPING_REFRESH_MS = 4_000;
 const DEFAULT_PROGRESS_LIMIT = 4_096;
+const PROGRESS_SPINNER_FRAMES = ['✦', '✧', '✶', '✳', '✢', '✳', '✶', '✧'] as const;
+const THINKING_LABELS = [
+  'Thinking',
+  'Exploring',
+  'Investigating',
+  'Mapping it out',
+  'Following the thread',
+  'Working through it',
+  'Checking the details',
+  'Connecting the dots',
+  'Narrowing it down',
+  'Making progress',
+  'Looking closer',
+  'Sorting it out',
+  'Tracing the path',
+  'Reviewing the pieces',
+  'Putting it together',
+  'Double-checking',
+] as const;
+const THINKING_LABEL_FRAME_SPAN = 3;
 
 export type BridgeContext = {
   readonly agents: AgentRegistry;
@@ -101,20 +122,40 @@ interface QuestionRetryState {
   readonly delayMs: number;
 }
 
+interface ToolProgress {
+  readonly callId: string;
+  readonly name: string;
+  readonly label: string;
+  readonly startedAt: number;
+  completedAt?: number;
+  outcome: 'running' | 'completed' | 'failed';
+}
+
+type ProgressPhase = 'thinking' | 'responding';
+
 interface ProgressState {
   readonly key: string;
   readonly adapter: MessengerAdapter;
   readonly chatId: string;
   readonly sessionId: string;
+  readonly startedAt: number;
   handle?: MessengerMessageHandle;
   ready: Promise<void>;
   text: string;
   readonly status: string[];
-  readonly toolNames: Map<string, string>;
+  readonly tools: Map<string, ToolProgress>;
+  readonly toolOrder: string[];
+  phase: ProgressPhase;
+  readonly thinkingOffset: number;
+  animationFrame: number;
+  animationTimer: ReturnType<typeof setInterval> | undefined;
   editTimer: ReturnType<typeof setTimeout> | undefined;
   typingTimer: ReturnType<typeof setInterval> | undefined;
+  flushInFlight: boolean;
+  flushRequested: boolean;
   lastRendered?: string;
   turnEnded: boolean;
+  finalizing: boolean;
 }
 
 export function parseCommand(text: string): ParsedCommand | undefined {
@@ -221,19 +262,214 @@ function safeToolName(name: string): string {
   return (compact || 'tool').slice(0, 80);
 }
 
+function concise(value: string, limit = 72): string {
+  const compact = value.replace(/\s+/g, ' ').trim();
+  const characters = Array.from(compact);
+  return characters.length <= limit ? compact : `${characters.slice(0, limit - 1).join('')}…`;
+}
+
+function toolArguments(raw: string): Record<string, unknown> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function stringArgument(args: Record<string, unknown> | undefined, key: string): string | undefined {
+  const value = args?.[key];
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function humanizeToolName(name: string): string {
+  const leaf = name.split(/[./:]/).filter(Boolean).at(-1) ?? 'tool';
+  const words = leaf.replaceAll('_', ' ').replaceAll('-', ' ').trim();
+  return words ? `${words[0]!.toUpperCase()}${words.slice(1)}` : 'Tool';
+}
+
+function quoted(value: string): string {
+  return `“${concise(value, 56)}”`;
+}
+
+function summarizeToolCall(name: string, rawArguments: string): string {
+  const args = toolArguments(rawArguments);
+  const leaf = name.split(/[./:]/).filter(Boolean).at(-1)?.toLowerCase() ?? name.toLowerCase();
+  const filePath = stringArgument(args, 'file_path');
+  const path = stringArgument(args, 'path');
+  const target = filePath ?? path;
+
+  if (leaf === 'read' && target !== undefined) {
+    const offset = typeof args?.offset === 'number' ? args.offset : undefined;
+    const limit = typeof args?.limit === 'number' ? args.limit : undefined;
+    const window = offset === undefined
+      ? ''
+      : ` · lines ${offset}${limit === undefined ? '+' : `–${offset + Math.max(0, limit - 1)}`}`;
+    return `Reading ${concise(target)}${window}`;
+  }
+  if (leaf === 'read_image' && target !== undefined) return `Inspecting ${concise(target)}`;
+  if ((leaf === 'write' || leaf === 'edit') && target !== undefined) {
+    return `${leaf === 'write' ? 'Writing' : 'Editing'} ${concise(target)}`;
+  }
+  if (leaf === 'glob') {
+    const pattern = stringArgument(args, 'pattern');
+    const where = stringArgument(args, 'path');
+    if (pattern !== undefined) return `Finding ${quoted(pattern)}${where === undefined ? '' : ` in ${concise(where, 44)}`}`;
+  }
+  if (leaf === 'grep') {
+    const pattern = stringArgument(args, 'pattern');
+    const where = stringArgument(args, 'path');
+    if (pattern !== undefined) return `Searching for ${quoted(pattern)}${where === undefined ? '' : ` in ${concise(where, 40)}`}`;
+  }
+  if (leaf === 'bash') {
+    const description = stringArgument(args, 'description');
+    return description === undefined ? 'Running a command' : concise(description);
+  }
+  if (leaf === 'web_search') {
+    const queries = args?.queries;
+    if (Array.isArray(queries)) {
+      const first = queries.find((query): query is string => typeof query === 'string' && query.trim().length > 0);
+      if (first !== undefined) return `Searching the web for ${quoted(first)}`;
+    }
+    return 'Searching the web';
+  }
+  if (leaf === 'skill') {
+    const skill = stringArgument(args, 'name');
+    if (skill !== undefined) return `Loading ${concise(skill, 48)} guidance`;
+  }
+  if (leaf === 'subagent' || leaf === 'subagent_fork') {
+    const description = stringArgument(args, 'description');
+    return description === undefined ? 'Delegating a task' : `Delegating · ${concise(description, 52)}`;
+  }
+  if (leaf === 'todo_write') return 'Updating the plan';
+  if (leaf === 'ask_user_question') return 'Preparing a question';
+  if (leaf === 'job_output') return 'Checking background work';
+  if (leaf === 'create_goal' || leaf === 'update_goal') return 'Updating the goal';
+
+  return humanizeToolName(safeToolName(name));
+}
+
+function elapsedSuffix(startedAt: number): string {
+  const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1_000));
+  return seconds < 2 ? '' : ` · ${seconds}s`;
+}
+
+function progressActivity(state: ProgressState): string {
+  const waiting = state.status.includes('❓ Waiting for your answer');
+  if (waiting) return '❓ Waiting for your answer';
+
+  const tools = state.toolOrder
+    .map((callId) => state.tools.get(callId))
+    .filter((tool): tool is ToolProgress => tool !== undefined);
+  const active = [...tools].reverse().find((tool) => tool.outcome === 'running');
+  const spinner = PROGRESS_SPINNER_FRAMES[state.animationFrame % PROGRESS_SPINNER_FRAMES.length]!;
+  const thinking = THINKING_LABELS[
+    (
+      state.thinkingOffset
+      + Math.floor(state.animationFrame / THINKING_LABEL_FRAME_SPAN)
+    ) % THINKING_LABELS.length
+  ]!;
+  const label = active?.label ?? (state.phase === 'responding' ? 'Writing the response' : thinking);
+  const startedAt = active?.startedAt ?? state.startedAt;
+  return `${spinner} ${label}…${elapsedSuffix(startedAt)}`;
+}
+
+function pushStatus(state: ProgressState, line: string): void {
+  for (let index = state.status.length - 1; index >= 0; index -= 1) {
+    if (state.status[index] === line) state.status.splice(index, 1);
+  }
+  state.status.push(line);
+}
+
+function replaceStatus(state: ProgressState, prefix: string, line: string): void {
+  for (let index = state.status.length - 1; index >= 0; index -= 1) {
+    if (state.status[index]?.startsWith(prefix)) state.status.splice(index, 1);
+  }
+  pushStatus(state, line);
+}
+
+function progressDetails(state: ProgressState): string {
+  const waiting = state.status.includes('❓ Waiting for your answer');
+  const tools = state.toolOrder
+    .map((callId) => state.tools.get(callId))
+    .filter((tool): tool is ToolProgress => tool !== undefined);
+  const active = [...tools].reverse().find((tool) => tool.outcome === 'running');
+  const toolLines = tools
+    .filter((tool) => tool !== active)
+    .slice(-3)
+    .map((tool) => `${tool.outcome === 'running' ? '◌' : tool.outcome === 'completed' ? '✓' : '×'} ${tool.label}`);
+  const statusLines = state.status
+    .filter((line) => !waiting || line !== '❓ Waiting for your answer')
+    .slice(-2);
+  return [...toolLines, ...statusLines].slice(-4).join('\n');
+}
+
+function clipPlainTail(
+  value: string,
+  limit: number,
+  measure: (text: string) => number,
+): string {
+  if (measure(value) <= limit) return value;
+  if (limit <= 0) return '';
+  const characters = Array.from(value);
+  let low = 0;
+  let high = characters.length;
+  let best = measure('…') <= limit ? '…' : '';
+  while (low <= high) {
+    const count = Math.floor((low + high) / 2);
+    const candidate = count === 0 ? '…' : `…${characters.slice(-count).join('')}`;
+    if (measure(candidate) <= limit) {
+      best = candidate;
+      low = count + 1;
+    } else {
+      high = count - 1;
+    }
+  }
+  return best;
+}
+
 function progressText(state: ProgressState): string {
   const rawBody = state.text.trim();
-  const body = rawBody && state.adapter.renderText !== undefined
-    ? state.adapter.renderText(rawBody)
-    : rawBody;
-  const status = state.status.slice(-4).join('\n');
-  const rendered = [body || (state.turnEnded ? 'Finished.' : 'Deep diving…'), status]
-    .filter(Boolean)
-    .join('\n\n');
-  const characters = Array.from(rendered);
+  const activity = state.turnEnded ? '' : progressActivity(state);
+  const details = progressDetails(state);
+  const placeholder = state.turnEnded ? 'Finished.' : activity;
   const limit = state.adapter.textLimit ?? DEFAULT_PROGRESS_LIMIT;
-  if (characters.length <= limit) return rendered;
-  return `…\n${characters.slice(-(limit - 2)).join('')}`;
+  const measure = (value: string): number => (
+    state.adapter.textLength?.(value) ?? Array.from(value).length
+  );
+  const renderBody = (value: string): string => (
+    value && state.adapter.renderText !== undefined ? state.adapter.renderText(value) : value
+  );
+  const compose = (body: string): string => [
+    body || placeholder,
+    activity && body ? activity : '',
+    details,
+  ].filter(Boolean).join('\n\n');
+
+  const rendered = compose(renderBody(rawBody));
+  if (measure(rendered) <= limit) return rendered;
+  if (!rawBody) return clipPlainTail(rendered, limit, measure);
+
+  const rawCharacters = Array.from(rawBody);
+  let low = 0;
+  let high = rawCharacters.length;
+  let best = '';
+  while (low <= high) {
+    const count = Math.floor((low + high) / 2);
+    const candidate = count === 0
+      ? ''
+      : `${count < rawCharacters.length ? '…\n' : ''}${rawCharacters.slice(-count).join('')}`;
+    const candidateRendered = compose(renderBody(candidate));
+    if (measure(candidateRendered) <= limit) {
+      best = candidateRendered;
+      low = count + 1;
+    } else {
+      high = count - 1;
+    }
+  }
+  return best || clipPlainTail(compose(''), limit, measure);
 }
 
 export class MessengerBridge {
@@ -254,6 +490,7 @@ export class MessengerBridge {
   private readonly questionRetryDelays = new Map<string, number>();
   private readonly resolvingQuestions = new Set<string>();
   private readonly control: DshControl;
+  private nextThinkingOffset = 0;
   private disposed = false;
 
   constructor(
@@ -342,7 +579,13 @@ export class MessengerBridge {
       return;
     }
 
-    await this.beginProgress(adapter, message.chatId, message.senderId, sessionId);
+    void this.beginProgress(adapter, message.chatId, message.senderId, sessionId)
+      .catch((error: unknown) => {
+        this.ctx.logger.warn(
+          'messenger: failed to show progress before submitting prompt: %o',
+          error,
+        );
+      });
     try {
       await this.control.prompt(sessionId, message.text, 'queue');
     } catch (error) {
@@ -358,7 +601,7 @@ export class MessengerBridge {
       || event.type === 'assistant/chunk'
       || event.type === 'tool/call'
     )) {
-      await this.beginProgressForBindings(sessionId);
+      this.beginProgressForBindings(sessionId);
     }
 
     const active = this.progressStates(sessionId);
@@ -370,11 +613,12 @@ export class MessengerBridge {
 
     if (event.type === 'assistant/chunk') {
       if (event.data.chunk.type === 'text-delta') {
-        for (const state of active) state.text += event.data.chunk.text;
-      } else if (event.data.chunk.type === 'reasoning-delta') {
         for (const state of active) {
-          if (!state.status.includes('💭 Reasoning…')) state.status.push('💭 Reasoning…');
+          state.text += event.data.chunk.text;
+          state.phase = 'responding';
         }
+      } else if (event.data.chunk.type === 'reasoning-delta') {
+        for (const state of active) state.phase = 'thinking';
       }
       this.scheduleProgressEdits(active);
       return;
@@ -383,10 +627,13 @@ export class MessengerBridge {
     if (event.type === 'assistant/message') {
       const text = visibleAssistantText(event);
       if (text !== undefined) {
-        for (const state of active) state.text = text;
+        for (const state of active) {
+          state.text = text;
+          state.phase = 'responding';
+        }
       }
       if (event.data.interrupted) {
-        for (const state of active) state.status.push('⏹ Interrupted');
+        for (const state of active) pushStatus(state, '⏹ Interrupted');
       }
       this.scheduleProgressEdits(active);
       return;
@@ -394,9 +641,20 @@ export class MessengerBridge {
 
     if (event.type === 'tool/call') {
       const name = safeToolName(event.data.name);
+      const callId = String(event.data.callId);
+      const label = summarizeToolCall(name, event.data.arguments);
       for (const state of active) {
-        state.toolNames.set(String(event.data.callId), name);
-        state.status.push(`🔧 ${name}`);
+        state.tools.set(callId, {
+          callId,
+          name,
+          label,
+          startedAt: event.time,
+          outcome: 'running',
+        });
+        const previous = state.toolOrder.indexOf(callId);
+        if (previous >= 0) state.toolOrder.splice(previous, 1);
+        state.toolOrder.push(callId);
+        state.phase = 'thinking';
       }
       this.scheduleProgressEdits(active);
       return;
@@ -405,8 +663,22 @@ export class MessengerBridge {
     if (event.type === 'tool/result') {
       const callId = String(event.data.message.source.callId);
       for (const state of active) {
-        const name = state.toolNames.get(callId) ?? 'tool';
-        state.status.push(`${event.data.error === undefined ? '✅' : '❌'} ${name}`);
+        const tool = state.tools.get(callId);
+        if (tool !== undefined) {
+          tool.completedAt = event.time;
+          tool.outcome = event.data.error === undefined ? 'completed' : 'failed';
+        } else {
+          state.tools.set(callId, {
+            callId,
+            name: 'tool',
+            label: 'Tool call',
+            startedAt: event.time,
+            completedAt: event.time,
+            outcome: event.data.error === undefined ? 'completed' : 'failed',
+          });
+          state.toolOrder.push(callId);
+        }
+        state.phase = 'thinking';
       }
       this.scheduleProgressEdits(active);
       return;
@@ -414,7 +686,11 @@ export class MessengerBridge {
 
     if (event.type === 'todo/write') {
       const completed = event.data.todos.filter((todo) => todo.status === 'completed').length;
-      for (const state of active) state.status.push(`📋 Checklist ${completed}/${event.data.todos.length}`);
+      for (const state of active) replaceStatus(
+        state,
+        '📋 Checklist ',
+        `📋 Checklist ${completed}/${event.data.todos.length}`,
+      );
       this.scheduleProgressEdits(active);
       return;
     }
@@ -422,12 +698,20 @@ export class MessengerBridge {
     if (event.type === 'turn/end') {
       for (const state of active) {
         state.turnEnded = true;
-        if (event.data.reason.kind === 'aborted') state.status.push('⏹ Cancelled');
-        if (event.data.reason.kind === 'error') state.status.push('❌ Turn failed');
-        if (event.data.reason.kind === 'blocked') state.status.push('⏸ Blocked');
-        if (event.data.reason.kind === 'max-tokens') state.status.push('⚠️ Output limit reached');
+        if (event.data.reason.kind === 'aborted') pushStatus(state, '⏹ Cancelled');
+        if (event.data.reason.kind === 'error') pushStatus(state, '❌ Turn failed');
+        if (event.data.reason.kind === 'blocked') pushStatus(state, '⏸ Blocked');
+        if (event.data.reason.kind === 'max-tokens') pushStatus(state, '⚠️ Output limit reached');
+        if (this.progress.get(state.key) === state) this.progress.delete(state.key);
       }
-      await Promise.all(active.map((state) => this.finalizeProgress(state)));
+      for (const state of active) {
+        void this.finalizeProgress(state).catch((error: unknown) => {
+          this.ctx.logger.warn(
+            'messenger: failed to finalize progress for one binding: %o',
+            error,
+          );
+        });
+      }
     }
   }
 
@@ -444,15 +728,15 @@ export class MessengerBridge {
     const progress = this.progressStates(sessionId);
     for (const state of progress) {
       this.stopTyping(state);
+      this.stopAnimation(state);
       if (!state.status.includes('❓ Waiting for your answer')) {
-        state.status.push('❓ Waiting for your answer');
+        pushStatus(state, '❓ Waiting for your answer');
       }
     }
-    const flushed = await Promise.allSettled(progress.map((state) => this.flushProgress(state)));
-    for (const result of flushed) {
-      if (result.status === 'rejected') {
-        this.ctx.logger.warn('messenger: failed to pause progress for user question: %o', result.reason);
-      }
+    for (const state of progress) {
+      void this.flushProgress(state).catch((error: unknown) => {
+        this.ctx.logger.warn('messenger: failed to pause progress for user question: %o', error);
+      });
     }
 
     const starts: Promise<unknown>[] = [];
@@ -524,8 +808,11 @@ export class MessengerBridge {
         const waiting = state.status.lastIndexOf('❓ Waiting for your answer');
         if (!stillPending && waiting >= 0) state.status.splice(waiting, 1);
         if (!stillPending) {
-          state.status.push(outcome === 'answered' ? '✅ Answered' : '⏹ Question cancelled');
-          if (!state.turnEnded && outcome === 'answered') this.startTyping(state);
+          pushStatus(state, outcome === 'answered' ? '✅ Answered' : '⏹ Question cancelled');
+          if (!state.turnEnded && outcome === 'answered') {
+            this.startTyping(state);
+            this.startAnimation(state);
+          }
         }
       }
       this.scheduleProgressEdits(progress);
@@ -950,8 +1237,10 @@ export class MessengerBridge {
     const keyboard = callbackKeyboard(rows);
     const renderedText = state.adapter.renderText?.(text) ?? text;
     const editLimit = state.adapter.textLimit ?? DEFAULT_PROGRESS_LIMIT;
+    const renderedLength = state.adapter.textLength?.(renderedText)
+      ?? Array.from(renderedText).length;
     try {
-      if (state.handle === undefined || Array.from(renderedText).length > editLimit) {
+      if (state.handle === undefined || renderedLength > editLimit) {
         state.handle = await state.adapter.sendText(state.chatId, renderedText, { keyboard });
       } else {
         await state.adapter.editText(state.chatId, state.handle.messageId, renderedText, keyboard);
@@ -1579,31 +1868,48 @@ export class MessengerBridge {
       await previous.ready;
       return previous;
     }
+    const thinkingOffset = this.nextThinkingOffset;
+    this.nextThinkingOffset = (this.nextThinkingOffset + 1) % THINKING_LABELS.length;
     const state: ProgressState = {
       key,
       adapter,
       chatId,
       sessionId,
+      startedAt: Date.now(),
       ready: Promise.resolve(),
       text: '',
       status: [],
-      toolNames: new Map(),
+      tools: new Map(),
+      toolOrder: [],
+      phase: 'thinking',
+      thinkingOffset,
+      animationFrame: 0,
+      animationTimer: undefined,
       editTimer: undefined,
       typingTimer: undefined,
+      flushInFlight: false,
+      flushRequested: false,
       turnEnded: false,
+      finalizing: false,
     };
     this.progress.set(key, state);
     const waitingForAnswer = [...this.questionRequests.values()].some(
       (request) => request.sessionId === sessionId,
     );
-    if (waitingForAnswer) state.status.push('❓ Waiting for your answer');
-    else this.startTyping(state);
-    state.ready = adapter.sendText(chatId, waitingForAnswer ? 'Waiting for your answer…' : 'Deep diving…', {
+    if (waitingForAnswer) pushStatus(state, '❓ Waiting for your answer');
+    else {
+      this.startTyping(state);
+      this.startAnimation(state);
+    }
+    const initialText = progressText(state);
+    state.lastRendered = initialText;
+    state.ready = adapter.sendText(chatId, initialText, {
       keyboard: callbackKeyboard([[
         this.button(adapter.id, chatId, senderId, 'Cancel', { kind: 'cancel', sessionId }),
       ]]),
     }).then((handle) => {
       state.handle = handle;
+      if (progressText(state) !== state.lastRendered) this.scheduleProgressEdits([state]);
     });
     try {
       await state.ready;
@@ -1615,8 +1921,7 @@ export class MessengerBridge {
     }
   }
 
-  private async beginProgressForBindings(sessionId: string): Promise<void> {
-    const starts: Promise<unknown>[] = [];
+  private beginProgressForBindings(sessionId: string): void {
     for (const [key, bound] of this.bindings) {
       if (bound !== sessionId) continue;
       const separator = key.indexOf(':');
@@ -1624,9 +1929,14 @@ export class MessengerBridge {
       if (adapter === undefined) continue;
       const chatId = key.slice(separator + 1);
       const senderId = this.bindingOperators.get(key) ?? chatId;
-      starts.push(this.beginProgress(adapter, chatId, senderId, sessionId));
+      void this.beginProgress(adapter, chatId, senderId, sessionId)
+        .catch((error: unknown) => {
+          this.ctx.logger.warn(
+            'messenger: failed to start progress for one binding: %o',
+            error,
+          );
+        });
     }
-    await Promise.all(starts);
   }
 
   private progressStates(sessionId: string): ProgressState[] {
@@ -1639,7 +1949,7 @@ export class MessengerBridge {
 
   private scheduleProgressEdits(states: readonly ProgressState[]): void {
     for (const state of states) {
-      if (state.handle === undefined || state.editTimer !== undefined) continue;
+      if (state.finalizing || state.handle === undefined || state.editTimer !== undefined) continue;
       state.editTimer = setTimeout(() => {
         state.editTimer = undefined;
         void this.flushProgress(state).catch((error: unknown) => this.logProgressError(error));
@@ -1649,21 +1959,35 @@ export class MessengerBridge {
   }
 
   private async flushProgress(state: ProgressState): Promise<void> {
-    await state.ready;
-    if (state.handle === undefined) return;
-    const rendered = progressText(state);
-    if (rendered === state.lastRendered) return;
-    state.lastRendered = rendered;
-    const keyboard = state.turnEnded ? [] : undefined;
-    await this.enqueueOutbound(state.key, () => state.adapter.editText(
-      state.chatId,
-      state.handle!.messageId,
-      rendered,
-      keyboard,
-    ));
+    if (state.finalizing) return;
+    if (state.flushInFlight) {
+      state.flushRequested = true;
+      return;
+    }
+    state.flushInFlight = true;
+    try {
+      do {
+        state.flushRequested = false;
+        await state.ready;
+        if (state.handle === undefined || state.finalizing) return;
+        const rendered = progressText(state);
+        if (rendered === state.lastRendered) continue;
+        const keyboard = state.turnEnded ? [] : undefined;
+        await this.enqueueOutbound(state.key, () => state.adapter.editText(
+          state.chatId,
+          state.handle!.messageId,
+          rendered,
+          keyboard,
+        ));
+        state.lastRendered = rendered;
+      } while (state.flushRequested && !state.finalizing);
+    } finally {
+      state.flushInFlight = false;
+    }
   }
 
   private async finalizeProgress(state: ProgressState): Promise<void> {
+    state.finalizing = true;
     if (state.editTimer !== undefined) {
       clearTimeout(state.editTimer);
       state.editTimer = undefined;
@@ -1672,13 +1996,21 @@ export class MessengerBridge {
     try {
       await state.ready;
       const rawFinalText = state.text.trim();
+      const sourceFinalText = rawFinalText || progressText(state);
       const finalText = rawFinalText
         ? state.adapter.renderText?.(rawFinalText) ?? rawFinalText
-        : progressText(state);
-      const chunks = state.adapter.splitText?.(finalText) ?? splitTelegramText(finalText);
+        : sourceFinalText;
       if (state.handle === undefined) {
         await state.adapter.sendText(state.chatId, finalText);
+      } else if (state.adapter.replaceText !== undefined) {
+        await this.enqueueOutbound(state.key, () => state.adapter.replaceText!(
+          state.chatId,
+          state.handle!.messageId,
+          sourceFinalText,
+          [],
+        ));
       } else {
+        const chunks = state.adapter.splitText?.(finalText) ?? splitTelegramText(finalText);
         await this.enqueueOutbound(state.key, async () => {
           await state.adapter.editText(state.chatId, state.handle!.messageId, chunks[0] ?? 'Finished.', []);
           for (const chunk of chunks.slice(1)) await state.adapter.sendText(state.chatId, chunk);
@@ -1702,9 +2034,24 @@ export class MessengerBridge {
       return;
     }
     state.text = '';
-    state.status.push(`❌ Could not send prompt: ${this.errorMessage(error)}`);
+    pushStatus(state, `❌ Could not send prompt: ${this.errorMessage(error)}`);
     state.turnEnded = true;
     await this.finalizeProgress(state);
+  }
+
+  private startAnimation(state: ProgressState): void {
+    if (state.animationTimer !== undefined || state.turnEnded || state.finalizing) return;
+    state.animationTimer = setInterval(() => {
+      state.animationFrame += 1;
+      void this.flushProgress(state).catch((error: unknown) => this.logProgressError(error));
+    }, PROGRESS_ANIMATION_INTERVAL_MS);
+    state.animationTimer.unref?.();
+  }
+
+  private stopAnimation(state: ProgressState): void {
+    if (state.animationTimer === undefined) return;
+    clearInterval(state.animationTimer);
+    state.animationTimer = undefined;
   }
 
   private startTyping(state: ProgressState): void {
@@ -1724,6 +2071,7 @@ export class MessengerBridge {
 
   private stopProgressTimers(state: ProgressState): void {
     this.stopTyping(state);
+    this.stopAnimation(state);
     if (state.editTimer !== undefined) {
       clearTimeout(state.editTimer);
       state.editTimer = undefined;
@@ -1744,7 +2092,15 @@ export class MessengerBridge {
         ),
       ));
     }
-    await Promise.all(sends);
+    const results = await Promise.allSettled(sends);
+    for (const result of results) {
+      if (result.status === 'rejected') {
+        this.ctx.logger.warn(
+          'messenger: failed to deliver assistant text to one binding: %o',
+          result.reason,
+        );
+      }
+    }
   }
 
   private enqueueAction<T>(key: string, action: () => Promise<T>): Promise<T> {

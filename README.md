@@ -16,8 +16,9 @@ A bridge plugin between [DeepSeek Harness](https://github.com/deepseek-ai/deepse
 - interactive `ask_user_question` choices, multi-select, and free-text answers;
 - context pressure, composition, and cumulative token-usage visibility;
 - follow-up, steering, and turn cancellation controls;
-- immediate `Deep diving…` feedback, typing activity, streamed message edits, and redacted tool/checklist status;
-- Unicode-safe splitting at Telegram's 4096-character limit;
+- Claude-style animated progress, typing activity, streamed message edits, and contextual tool/checklist status;
+- safe Telegram Markdown rendering for headings, emphasis, code, links, quotes, and lists;
+- formatting-preserving splitting at Telegram's 4096-character limit;
 - low-latency batch polling without per-chat head-of-line blocking;
 - a shared `MessengerAdapter` interface for future transports.
 

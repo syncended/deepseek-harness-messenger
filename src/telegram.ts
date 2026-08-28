@@ -109,6 +109,211 @@ export class TelegramApiError extends Error {
   }
 }
 
+function escapeTelegramHtml(value: string, attribute = false): string {
+  const escaped = value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
+  return attribute ? escaped.replaceAll('"', '&quot;') : escaped;
+}
+
+function markdownUrlEnd(source: string, start: number): number {
+  let depth = 1;
+  for (let index = start; index < source.length; index += 1) {
+    if (source[index] === '\\') {
+      index += 1;
+      continue;
+    }
+    if (source[index] === '(') depth += 1;
+    if (source[index] === ')') {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+function renderTelegramInline(source: string): string {
+  let rendered = '';
+  let index = 0;
+  const wrap = (delimiter: string, openTag: string, closeTag = openTag): boolean => {
+    if (!source.startsWith(delimiter, index)) return false;
+    const end = source.indexOf(delimiter, index + delimiter.length);
+    if (end <= index + delimiter.length) return false;
+    rendered += `<${openTag}>${renderTelegramInline(source.slice(index + delimiter.length, end))}</${closeTag}>`;
+    index = end + delimiter.length;
+    return true;
+  };
+
+  while (index < source.length) {
+    if (
+      source[index] === '\\'
+      && index + 1 < source.length
+      && /[\\`*_[\]{}()#+\-.!|>]/.test(source[index + 1]!)
+    ) {
+      rendered += escapeTelegramHtml(source[index + 1]!);
+      index += 2;
+      continue;
+    }
+    if (source[index] === '`') {
+      const end = source.indexOf('`', index + 1);
+      if (end > index + 1) {
+        rendered += `<code>${escapeTelegramHtml(source.slice(index + 1, end))}</code>`;
+        index = end + 1;
+        continue;
+      }
+    }
+    if (source[index] === '[') {
+      const labelEnd = source.indexOf('](', index + 1);
+      const urlEnd = labelEnd < 0 ? -1 : markdownUrlEnd(source, labelEnd + 2);
+      if (labelEnd > index + 1 && urlEnd > labelEnd + 2) {
+        const label = source.slice(index + 1, labelEnd);
+        const url = source.slice(labelEnd + 2, urlEnd).trim();
+        if (/^(?:https?:\/\/|tg:\/\/|mailto:)/i.test(url)) {
+          rendered += `<a href="${escapeTelegramHtml(url, true)}">${renderTelegramInline(label)}</a>`;
+        } else {
+          rendered += `${renderTelegramInline(label)} (${escapeTelegramHtml(url)})`;
+        }
+        index = urlEnd + 1;
+        continue;
+      }
+    }
+    if (
+      wrap('**', 'b')
+      || wrap('__', 'b')
+      || wrap('~~', 's')
+      || wrap('||', 'span class="tg-spoiler"', 'span')
+      || wrap('*', 'i')
+    ) continue;
+
+    rendered += escapeTelegramHtml(source[index]!);
+    index += 1;
+  }
+  return rendered;
+}
+
+/** Convert common model Markdown into Telegram's supported HTML subset. */
+export function renderTelegramMarkdown(text: string): string {
+  const lines = text.replaceAll('\r\n', '\n').split('\n');
+  const rendered: string[] = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    const fence = line.match(/^\s*```\s*([A-Za-z0-9_+.-]*)\s*$/);
+    if (fence !== null) {
+      const code: string[] = [];
+      while (index + 1 < lines.length && !/^\s*```\s*$/.test(lines[index + 1]!)) {
+        index += 1;
+        code.push(lines[index]!);
+      }
+      if (index + 1 < lines.length) index += 1;
+      const language = fence[1]
+        ? ` class="language-${escapeTelegramHtml(fence[1], true)}"`
+        : '';
+      rendered.push(`<pre><code${language}>${escapeTelegramHtml(code.join('\n'))}</code></pre>`);
+      continue;
+    }
+
+    if (/^\s*>\s?/.test(line)) {
+      const quote: string[] = [line.replace(/^\s*>\s?/, '')];
+      while (index + 1 < lines.length && /^\s*>\s?/.test(lines[index + 1]!)) {
+        index += 1;
+        quote.push(lines[index]!.replace(/^\s*>\s?/, ''));
+      }
+      rendered.push(`<blockquote>${quote.map(renderTelegramInline).join('\n')}</blockquote>`);
+      continue;
+    }
+
+    const heading = line.match(/^\s{0,3}#{1,6}\s+(.+)$/);
+    if (heading !== null) {
+      rendered.push(`<b>${renderTelegramInline(heading[1]!)}</b>`);
+      continue;
+    }
+    const bullet = line.match(/^\s*[-+*]\s+(.+)$/);
+    if (bullet !== null) {
+      rendered.push(`• ${renderTelegramInline(bullet[1]!)}`);
+      continue;
+    }
+    rendered.push(renderTelegramInline(line));
+  }
+
+  return rendered.join('\n');
+}
+
+function telegramHtmlVisibleLength(html: string): number {
+  const tokens = html.match(/<[^>]+>|&(?:#\d+|#x[\da-f]+|[a-z]+);|[^<&]+|[<&]/gi) ?? [];
+  let length = 0;
+  for (const token of tokens) {
+    if (token.startsWith('<')) continue;
+    length += /^&(?:#\d+|#x[\da-f]+|[a-z]+);$/i.test(token) ? 1 : token.length;
+  }
+  return length;
+}
+
+interface OpenHtmlTag {
+  readonly source: string;
+  readonly name: string;
+}
+
+/** Split generated Telegram HTML while closing and reopening formatting tags. */
+export function splitTelegramHtml(
+  html: string,
+  limit = TELEGRAM_TEXT_LIMIT,
+): string[] {
+  if (!Number.isSafeInteger(limit) || limit < 1) {
+    throw new TypeError('Telegram text limit must be a positive safe integer');
+  }
+  const tokens = html.match(/<[^>]+>|&(?:#\d+|#x[\da-f]+|[a-z]+);|[^<&]+|[<&]/gi) ?? [];
+  const chunks: string[] = [];
+  const open: OpenHtmlTag[] = [];
+  let current = '';
+  let visible = 0;
+
+  const closeTags = (): string => [...open]
+    .reverse()
+    .map((tag) => `</${tag.name}>`)
+    .join('');
+  const reopenTags = (): string => open.map((tag) => tag.source).join('');
+  const flush = (): void => {
+    if (!current) return;
+    chunks.push(`${current}${closeTags()}`);
+    current = reopenTags();
+    visible = 0;
+  };
+  const appendVisible = (value: string, width: number): void => {
+    if (visible > 0 && visible + width > limit) flush();
+    current += value;
+    visible += width;
+  };
+
+  for (const token of tokens) {
+    if (token.startsWith('<')) {
+      const closing = token.match(/^<\/([a-z0-9-]+)>$/i);
+      if (closing !== null) {
+        current += token;
+        const last = open.at(-1);
+        if (last?.name.toLowerCase() === closing[1]!.toLowerCase()) open.pop();
+        continue;
+      }
+      const opening = token.match(/^<([a-z0-9-]+)(?:\s[^>]*)?>$/i);
+      if (opening !== null) {
+        current += token;
+        open.push({ source: token, name: opening[1]! });
+        continue;
+      }
+      appendVisible(escapeTelegramHtml(token), token.length);
+      continue;
+    }
+    if (/^&(?:#\d+|#x[\da-f]+|[a-z]+);$/i.test(token)) {
+      appendVisible(token, 1);
+      continue;
+    }
+    for (const character of token) appendVisible(character, character.length);
+  }
+  if (current) chunks.push(`${current}${closeTags()}`);
+  return chunks.length > 0 ? chunks : [''];
+}
+
 export function splitTelegramText(
   text: string,
   limit = TELEGRAM_TEXT_LIMIT,
@@ -266,12 +471,17 @@ function inboundUpdate(
 
 export class TelegramAdapter implements MessengerAdapter {
   readonly id = 'telegram';
+  readonly textLimit = TELEGRAM_TEXT_LIMIT;
   private readonly fetchImpl: typeof globalThis.fetch;
   private botUsername: string | undefined;
   private commandsRegistered = false;
 
   constructor(private readonly options: TelegramAdapterOptions) {
     this.fetchImpl = options.fetch ?? globalThis.fetch;
+  }
+
+  textLength(text: string): number {
+    return telegramHtmlVisibleLength(renderTelegramMarkdown(text));
   }
 
   async validate(signal?: AbortSignal): Promise<void> {
@@ -411,17 +621,16 @@ export class TelegramAdapter implements MessengerAdapter {
     text: string,
     options: SendTextOptions = {},
   ): Promise<MessengerMessageHandle> {
+    const chunks = splitTelegramHtml(renderTelegramMarkdown(text));
     let first: MessengerMessageHandle | undefined;
-    const markup = replyMarkup(options.keyboard);
-    for (const [index, chunk] of splitTelegramText(text).entries()) {
-      const sent = await this.call<TelegramSentMessage>('sendMessage', {
-        chat_id: chatId,
-        text: chunk,
-        ...(index === 0 && markup !== undefined ? { reply_markup: markup } : {}),
-      });
-      first ??= { chatId, messageId: String(sent.message_id) };
+    for (const [index, chunk] of chunks.entries()) {
+      const handle = await this.sendHtmlText(
+        chatId,
+        chunk,
+        index === 0 ? options.keyboard : undefined,
+      );
+      first ??= handle;
     }
-    // splitTelegramText always returns at least one chunk, including for ''.
     return first!;
   }
 
@@ -431,15 +640,52 @@ export class TelegramAdapter implements MessengerAdapter {
     text: string,
     keyboard?: MessengerInlineKeyboard,
   ): Promise<void> {
-    if (Array.from(text).length > TELEGRAM_TEXT_LIMIT) {
-      throw new RangeError('Telegram edited text exceeds 4096 characters');
+    const chunks = splitTelegramHtml(renderTelegramMarkdown(text));
+    if (chunks.length !== 1) {
+      throw new RangeError('Telegram edited text exceeds 4096 visible characters');
     }
+    await this.editHtmlText(chatId, messageId, chunks[0]!, keyboard);
+  }
+
+  async replaceText(
+    chatId: string,
+    messageId: string,
+    text: string,
+    keyboard?: MessengerInlineKeyboard,
+  ): Promise<void> {
+    const chunks = splitTelegramHtml(renderTelegramMarkdown(text));
+    await this.editHtmlText(chatId, messageId, chunks[0]!, keyboard);
+    for (const chunk of chunks.slice(1)) await this.sendHtmlText(chatId, chunk);
+  }
+
+  private async sendHtmlText(
+    chatId: string,
+    html: string,
+    keyboard?: MessengerInlineKeyboard,
+  ): Promise<MessengerMessageHandle> {
+    const markup = replyMarkup(keyboard);
+    const sent = await this.call<TelegramSentMessage>('sendMessage', {
+      chat_id: chatId,
+      text: html,
+      parse_mode: 'HTML',
+      ...(markup === undefined ? {} : { reply_markup: markup }),
+    });
+    return { chatId, messageId: String(sent.message_id) };
+  }
+
+  private async editHtmlText(
+    chatId: string,
+    messageId: string,
+    html: string,
+    keyboard?: MessengerInlineKeyboard,
+  ): Promise<void> {
     const markup = replyMarkup(keyboard);
     try {
       await this.call('editMessageText', {
         chat_id: chatId,
         message_id: messageId,
-        text,
+        text: html,
+        parse_mode: 'HTML',
         ...(markup === undefined ? {} : { reply_markup: markup }),
       });
     } catch (error) {

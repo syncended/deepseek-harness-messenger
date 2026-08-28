@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { TelegramAdapter, TelegramApiError } from '../src/telegram.js';
+import {
+  renderTelegramMarkdown,
+  splitTelegramHtml,
+  TelegramAdapter,
+  TelegramApiError,
+} from '../src/telegram.js';
 
 function jsonResponse(result: unknown): Response {
   return new Response(JSON.stringify({ ok: true, result }), {
@@ -37,6 +42,68 @@ function adapterWith(fetch: typeof globalThis.fetch, options: {
     ...(options.onError === undefined ? {} : { onError: options.onError }),
   });
 }
+
+describe('renderTelegramMarkdown', () => {
+  it('renders common model Markdown with Telegram HTML', () => {
+    expect(renderTelegramMarkdown([
+      '# Result',
+      '',
+      '**Bold**, *italic*, `inline` and [docs](https://example.com?a=1&b=2).',
+      '- first item',
+      '> quoted <text>',
+    ].join('\n'))).toBe([
+      '<b>Result</b>',
+      '',
+      '<b>Bold</b>, <i>italic</i>, <code>inline</code> and <a href="https://example.com?a=1&amp;b=2">docs</a>.',
+      '• first item',
+      '<blockquote>quoted &lt;text&gt;</blockquote>',
+    ].join('\n'));
+  });
+
+  it('preserves fenced code literally and escapes raw HTML', () => {
+    expect(renderTelegramMarkdown('```ts\nconst tag = "<b>";\n```\n<div>unsafe</div>')).toBe(
+      '<pre><code class="language-ts">const tag = "&lt;b&gt;";</code></pre>\n&lt;div&gt;unsafe&lt;/div&gt;',
+    );
+    expect(renderTelegramMarkdown('Path C:\\work\\file')).toBe('Path C:\\work\\file');
+    expect(renderTelegramMarkdown('[docs](https://example.com/a_(b))')).toBe(
+      '<a href="https://example.com/a_(b)">docs</a>',
+    );
+  });
+});
+
+describe('splitTelegramHtml', () => {
+  it('closes and reopens formatting across visible-text boundaries', () => {
+    const html = renderTelegramMarkdown(`**${'x'.repeat(250)}**`);
+    const chunks = splitTelegramHtml(html, 100);
+
+    expect(chunks).toHaveLength(3);
+    expect(chunks.every((chunk) => chunk.startsWith('<b>') && chunk.endsWith('</b>'))).toBe(true);
+    expect(chunks.map((chunk) => chunk.replace(/<[^>]+>/g, '').length)).toEqual([100, 100, 50]);
+  });
+
+  it('keeps long fenced code blocks independently valid', () => {
+    const html = renderTelegramMarkdown(`\`\`\`ts\n${'🙂'.repeat(120)}\n\`\`\``);
+    const chunks = splitTelegramHtml(html, 80);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.every((chunk) => (
+      chunk.startsWith('<pre><code class="language-ts">')
+      && chunk.endsWith('</code></pre>')
+    ))).toBe(true);
+    expect(chunks.every((chunk) => (
+      chunk.replace(/<[^>]+>/g, '').length <= 80
+    ))).toBe(true);
+  });
+});
+
+describe('TelegramAdapter text accounting', () => {
+  it('counts formatted text after entities using UTF-16 units', () => {
+    const adapter = adapterWith(vi.fn<typeof globalThis.fetch>());
+
+    expect(adapter.textLength('**x** & <tag>')).toBe('x & <tag>'.length);
+    expect(adapter.textLength('🙂')).toBe(2);
+  });
+});
 
 describe('TelegramAdapter credentials', () => {
   it('re-resolves a token for every API operation', async () => {
@@ -425,6 +492,7 @@ describe('TelegramAdapter interactions and transport methods', () => {
     expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
       chat_id: '42',
       text: 'Pick',
+      parse_mode: 'HTML',
       reply_markup: {
         inline_keyboard: [[
           { text: 'Choose', callback_data: 'choice:1' },
@@ -432,6 +500,51 @@ describe('TelegramAdapter interactions and transport methods', () => {
         ]],
       },
     });
+  });
+
+  it('sends and edits messages using parsed Telegram HTML', async () => {
+    const fetchMock = vi.fn<typeof globalThis.fetch>(async () => jsonResponse(true));
+    const adapter = adapterWith(fetchMock);
+
+    await adapter.sendText('42', '**Ready** & safe');
+    await adapter.editText('42', '9', '# Updated\n`value`');
+
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
+      chat_id: '42',
+      text: '<b>Ready</b> &amp; safe',
+      parse_mode: 'HTML',
+    });
+    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toMatchObject({
+      chat_id: '42',
+      message_id: '9',
+      text: '<b>Updated</b>\n<code>value</code>',
+      parse_mode: 'HTML',
+    });
+  });
+
+  it('replaces a placeholder and spills long formatted output safely', async () => {
+    let nextMessageId = 20;
+    const fetchMock = vi.fn<typeof globalThis.fetch>(async () => (
+      jsonResponse({ message_id: nextMessageId += 1 })
+    ));
+    const adapter = adapterWith(fetchMock);
+
+    await adapter.replaceText('42', '9', `**${'x'.repeat(5_000)}**`, []);
+
+    const requests = fetchMock.mock.calls.map((call) => ({
+      operation: String(call[0]).split('/').pop(),
+      body: JSON.parse(String(call[1]?.body)) as Record<string, unknown>,
+    }));
+    expect(requests[0]?.operation).toBe('editMessageText');
+    expect(requests.slice(1).every(({ operation }) => operation === 'sendMessage')).toBe(true);
+    expect(requests.length).toBeGreaterThan(1);
+    expect(requests.every(({ body }) => (
+      body.parse_mode === 'HTML'
+      && typeof body.text === 'string'
+      && body.text.startsWith('<b>')
+      && body.text.endsWith('</b>')
+      && body.text.replace(/<[^>]+>/g, '').length <= 4_096
+    ))).toBe(true);
   });
 
   it('captures Telegram error codes and retry-after metadata', async () => {

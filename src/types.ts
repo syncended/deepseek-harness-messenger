@@ -62,8 +62,10 @@ export interface SendTextOptions {
 
 export interface MessengerAdapter {
   readonly id: string;
-  /** Maximum Unicode code points accepted by an edited text message. */
+  /** Maximum transport-measured characters accepted by an edited text message. */
   readonly textLimit?: number;
+  /** Measure text exactly as editText will account for it. */
+  textLength?(text: string): number;
   /** Convert common Markdown into the transport's supported rich-text dialect. */
   renderText?(text: string): string;
   /** Split text according to transport-specific message limits. */
@@ -78,6 +80,13 @@ export interface MessengerAdapter {
     options?: SendTextOptions,
   ): Promise<MessengerMessageHandle>;
   editText(
+    chatId: string,
+    messageId: string,
+    text: string,
+    keyboard?: MessengerInlineKeyboard,
+  ): Promise<void>;
+  /** Replace one message and spill overflow into follow-up messages. */
+  replaceText?(
     chatId: string,
     messageId: string,
     text: string,

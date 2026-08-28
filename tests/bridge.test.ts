@@ -51,14 +51,14 @@ class FakeAdapter implements MessengerAdapter {
   }
 }
 
-function message(text: string): InboundTextMessage {
+function message(text: string, chatId = '100'): InboundTextMessage {
   return {
     kind: 'message',
     transport: 'telegram',
     messageId: randomId(),
-    chatId: '100',
+    chatId,
     chatKind: 'private',
-    senderId: '100',
+    senderId: chatId,
     text,
   };
 }
@@ -545,6 +545,36 @@ describe('MessengerBridge controls', () => {
     await bridge.dispose();
   });
 
+  it('uses transport-aware length when a batch question cannot be edited', async () => {
+    const { ctx } = fakeContext();
+    const adapter = new FakeAdapter();
+    Object.assign(adapter, {
+      textLimit: 4_096,
+      textLength: (text: string) => text.length,
+    });
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    });
+    bridge.registerAdapter(adapter);
+    await bridge.handle(message('/resume session-1'));
+    await bridge.onQuestionRequested(RpcId('question-utf16-limit'), 'session-1', [{
+      id: 'first',
+      question: 'Short question?',
+    }, {
+      id: 'emoji',
+      question: '🙂'.repeat(3_000),
+    }]);
+    const editsBefore = adapter.edits.length;
+
+    await bridge.handle(message('first answer'));
+
+    expect(adapter.edits).toHaveLength(editsBefore);
+    expect(adapter.sent.at(-1)?.text).toContain('🙂'.repeat(100));
+    await bridge.dispose();
+  });
+
   it('keeps the visible question active when rendering the next batch item fails', async () => {
     const { ctx } = fakeContext();
     const adapter = new FakeAdapter();
@@ -662,7 +692,7 @@ describe('MessengerBridge controls', () => {
     } as unknown as SessionEvent);
 
     expect(adapter.typing).toBe(0);
-    expect(adapter.sent.at(-1)?.text).toBe('Waiting for your answer…');
+    expect(adapter.sent.at(-1)?.text).toBe('❓ Waiting for your answer');
     await bridge.dispose();
   });
 
@@ -709,8 +739,8 @@ describe('MessengerBridge controls', () => {
     expect(agent.cancel).not.toHaveBeenCalled();
   });
 
-  it('cleans up progress state when the initial placeholder send fails', async () => {
-    const { ctx } = fakeContext();
+  it('submits the prompt and cleans up when the initial placeholder send fails', async () => {
+    const { ctx, prompt } = fakeContext();
     const adapter = new FakeAdapter();
     const bridge = new MessengerBridge(ctx, {
       allowedChatIds: ['100'],
@@ -722,11 +752,47 @@ describe('MessengerBridge controls', () => {
     const send = vi.spyOn(adapter, 'sendText');
     send.mockRejectedValueOnce(new Error('Telegram unavailable'));
 
-    await expect(bridge.handle(message('first try'))).rejects.toThrow('Telegram unavailable');
+    await expect(bridge.handle(message('first try'))).resolves.toBeUndefined();
+    expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
+      payload: expect.objectContaining({
+        content: [{ type: 'text', text: 'first try' }],
+        mode: 'queue',
+      }),
+    }));
     send.mockRestore();
     await bridge.handle(message('second try'));
 
-    expect(adapter.sent.filter((entry) => entry.text === 'Deep diving…')).toHaveLength(1);
+    expect(adapter.sent.filter((entry) => entry.text.startsWith('✦ Exploring'))).toHaveLength(1);
+    await bridge.dispose();
+  });
+
+  it('does not delay prompt submission behind a pending placeholder send', async () => {
+    const { ctx, prompt } = fakeContext();
+    const adapter = new FakeAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    });
+    bridge.registerAdapter(adapter);
+    await bridge.handle(message('/resume session-1'));
+    let release: (() => void) | undefined;
+    vi.spyOn(adapter, 'sendText').mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return { chatId: '100', messageId: 'pending-progress' };
+    });
+
+    const handling = bridge.handle(message('start immediately'));
+    await vi.waitFor(() => expect(prompt).toHaveBeenCalled());
+    expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
+      payload: expect.objectContaining({
+        content: [{ type: 'text', text: 'start immediately' }],
+      }),
+    }));
+    release?.();
+    await handling;
     await bridge.dispose();
   });
 
@@ -758,6 +824,58 @@ describe('MessengerBridge controls', () => {
     await disposing;
 
     expect(sessions.create).not.toHaveBeenCalled();
+  });
+
+  it('isolates progress failures between bindings of the same session', async () => {
+    const { ctx } = fakeContext();
+    const adapter = new FakeAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100', '200'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    });
+    bridge.registerAdapter(adapter);
+    await bridge.handle(message('/resume session-1', '100'));
+    await bridge.handle(message('/resume session-1', '200'));
+    const originalSend = adapter.sendText.bind(adapter);
+    vi.spyOn(adapter, 'sendText').mockImplementation(async (chatId, text, options) => {
+      if (chatId === '100') return new Promise<never>(() => {});
+      return originalSend(chatId, text, options);
+    });
+
+    await expect(bridge.onSessionEvent('session-1', {
+      type: 'turn/start',
+      seq: 1,
+      time: Date.now(),
+      data: { turn: 1 },
+    } as unknown as SessionEvent)).resolves.toBeUndefined();
+    await bridge.onSessionEvent('session-1', {
+      type: 'assistant/message',
+      seq: 2,
+      time: Date.now(),
+      surfaceOp: 'append',
+      data: {
+        turn: 1,
+        step: 1,
+        message: { content: [{ type: 'text', text: 'Healthy binding result.' }] },
+      },
+    } as unknown as SessionEvent);
+    await expect(bridge.onSessionEvent('session-1', {
+      type: 'turn/end',
+      seq: 3,
+      time: Date.now(),
+      data: { turn: 1, reason: { kind: 'completed' } },
+    } as unknown as SessionEvent)).resolves.toBeUndefined();
+
+    await vi.waitFor(() => expect(adapter.edits).toContainEqual(expect.objectContaining({
+      chatId: '200',
+      text: 'Healthy binding result.',
+    })));
+    expect(ctx.logger.warn).not.toHaveBeenCalledWith(
+      'messenger: failed to start progress for one binding: %o',
+      expect.anything(),
+    );
+    await bridge.dispose();
   });
 
   it('uses transport-specific rich-text rendering for assistant messages', async () => {
@@ -793,6 +911,48 @@ describe('MessengerBridge controls', () => {
     await bridge.dispose();
   });
 
+  it('truncates source before rich rendering so markup stays balanced', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ctx } = fakeContext();
+      const adapter = new FakeAdapter();
+      Object.assign(adapter, {
+        textLimit: 120,
+        renderText: (text: string) => `<b>${text}</b>`,
+      });
+      const bridge = new MessengerBridge(ctx, {
+        allowedChatIds: ['100'],
+        allowedUserIds: [],
+        privateChatsOnly: true,
+      });
+      bridge.registerAdapter(adapter);
+      await bridge.handle(message('/resume session-1'));
+      await bridge.handle(message('stream a long answer'));
+
+      await bridge.onSessionEvent('session-1', {
+        type: 'assistant/chunk',
+        seq: 1,
+        time: Date.now(),
+        data: {
+          turn: 1,
+          step: 1,
+          chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(500) },
+        },
+      } as unknown as SessionEvent);
+      await vi.advanceTimersByTimeAsync(800);
+
+      const edited = adapter.edits.at(-1)?.text ?? '';
+      expect(Array.from(edited).length).toBeLessThanOrEqual(120);
+      expect(edited).toMatch(/^<b>…\n/);
+      expect(edited).toContain('</b>\n\n');
+      expect(edited.match(/<b>/g)).toHaveLength(1);
+      expect(edited.match(/<\/b>/g)).toHaveLength(1);
+      await bridge.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('drops a failed final-delivery state before the next turn', async () => {
     const { ctx } = fakeContext();
     const adapter = new FakeAdapter();
@@ -812,7 +972,11 @@ describe('MessengerBridge controls', () => {
       seq: 1,
       time: Date.now(),
       data: { turn: 1, reason: { kind: 'completed' } },
-    } as unknown as SessionEvent)).rejects.toThrow('edit failed');
+    } as unknown as SessionEvent)).resolves.toBeUndefined();
+    await vi.waitFor(() => expect(ctx.logger.warn).toHaveBeenCalledWith(
+      'messenger: failed to finalize progress for one binding: %o',
+      expect.any(Error),
+    ));
     edit.mockRestore();
 
     await bridge.onSessionEvent('session-1', {
@@ -821,11 +985,160 @@ describe('MessengerBridge controls', () => {
       time: Date.now(),
       data: { turn: 2 },
     } as unknown as SessionEvent);
-    expect(adapter.sent.filter((entry) => entry.text === 'Deep diving…')).toHaveLength(2);
+    expect(adapter.sent.some((entry) => entry.text.startsWith('✦ Exploring'))).toBe(true);
     await bridge.dispose();
   });
 
-  it('starts with Deep diving and progressively edits tool status and final text', async () => {
+  it('coalesces animation frames while one progress edit is in flight', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ctx } = fakeContext();
+      const adapter = new FakeAdapter();
+      const bridge = new MessengerBridge(ctx, {
+        allowedChatIds: ['100'],
+        allowedUserIds: [],
+        privateChatsOnly: true,
+      });
+      bridge.registerAdapter(adapter);
+      await bridge.handle(message('/resume session-1'));
+      await bridge.handle(message('slow transport'));
+      const originalEdit = adapter.editText.bind(adapter);
+      let release: (() => void) | undefined;
+      const edit = vi.spyOn(adapter, 'editText').mockImplementationOnce(async (...args) => {
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        await originalEdit(...args);
+      });
+
+      await vi.advanceTimersByTimeAsync(1_600);
+      await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+      await vi.advanceTimersByTimeAsync(16_000);
+      expect(edit).toHaveBeenCalledTimes(1);
+
+      await bridge.onSessionEvent('session-1', {
+        type: 'assistant/message',
+        seq: 1,
+        time: Date.now(),
+        surfaceOp: 'append',
+        data: {
+          turn: 1,
+          step: 1,
+          message: { content: [{ type: 'text', text: 'Final answer.' }] },
+        },
+      } as unknown as SessionEvent);
+      await bridge.onSessionEvent('session-1', {
+        type: 'turn/end',
+        seq: 2,
+        time: Date.now(),
+        data: { turn: 1, reason: { kind: 'completed' } },
+      } as unknown as SessionEvent);
+      expect(edit).toHaveBeenCalledTimes(1);
+      const sentBeforeNextTurn = adapter.sent.length;
+      await bridge.onSessionEvent('session-1', {
+        type: 'turn/start',
+        seq: 3,
+        time: Date.now(),
+        data: { turn: 2 },
+      } as unknown as SessionEvent);
+      expect(adapter.sent.length).toBe(sentBeforeNextTurn + 1);
+
+      release?.();
+      await vi.waitFor(() => expect(edit).toHaveBeenCalledTimes(2));
+      expect(adapter.edits.at(-1)?.text).toBe('Final answer.');
+      await bridge.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cycles through all generic activity labels before repeating one', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ctx } = fakeContext();
+      const adapter = new FakeAdapter();
+      const bridge = new MessengerBridge(ctx, {
+        allowedChatIds: ['100'],
+        allowedUserIds: [],
+        privateChatsOnly: true,
+      });
+      bridge.registerAdapter(adapter);
+      await bridge.handle(message('/resume session-1'));
+      await bridge.handle(message('long investigation'));
+      const labels = [adapter.sent.at(-1)?.text.match(/^. (.+?)…/)?.[1]];
+
+      for (let index = 1; index <= 16; index += 1) {
+        await vi.advanceTimersByTimeAsync(4_800);
+        labels.push(adapter.edits.at(-1)?.text.match(/^. (.+?)…/)?.[1]);
+      }
+
+      expect(new Set(labels.slice(0, 16))).toHaveLength(16);
+      expect(labels[16]).toBe(labels[0]);
+      await bridge.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a concise completed-tool trail with argument-aware labels', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ctx } = fakeContext();
+      const adapter = new FakeAdapter();
+      const bridge = new MessengerBridge(ctx, {
+        allowedChatIds: ['100'],
+        allowedUserIds: [],
+        privateChatsOnly: true,
+      });
+      bridge.registerAdapter(adapter);
+      await bridge.handle(message('/resume session-1'));
+      await bridge.handle(message('Find the progress renderer'));
+
+      await bridge.onSessionEvent('session-1', {
+        type: 'tool/call',
+        seq: 2,
+        time: Date.now(),
+        data: {
+          turn: 1,
+          step: 1,
+          callId: 'search-1',
+          name: 'functions.grep',
+          arguments: JSON.stringify({ pattern: 'progressText', path: 'src' }),
+        },
+      } as unknown as SessionEvent);
+      await vi.advanceTimersByTimeAsync(800);
+      expect(adapter.edits.at(-1)?.text).toContain('Searching for “progressText” in src…');
+
+      await bridge.onSessionEvent('session-1', {
+        type: 'tool/result',
+        seq: 3,
+        time: Date.now(),
+        data: {
+          turn: 1,
+          step: 1,
+          message: { source: { callId: 'search-1' }, content: [] },
+        },
+      } as unknown as SessionEvent);
+      await vi.advanceTimersByTimeAsync(800);
+      expect(adapter.edits.at(-1)?.text).toContain('✓ Searching for “progressText” in src');
+
+      const todoEvent = {
+        type: 'todo/write',
+        seq: 4,
+        time: Date.now(),
+        data: { todos: [{ content: 'Check it', status: 'in_progress' }] },
+      } as unknown as SessionEvent;
+      await bridge.onSessionEvent('session-1', todoEvent);
+      await bridge.onSessionEvent('session-1', todoEvent);
+      await vi.advanceTimersByTimeAsync(800);
+      expect(adapter.edits.at(-1)?.text.match(/Checklist 0\/1/g)).toHaveLength(1);
+      await bridge.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('animates progress, describes tool work, and finishes with the final text', async () => {
     vi.useFakeTimers();
     try {
       const { ctx, prompt } = fakeContext();
@@ -839,7 +1152,9 @@ describe('MessengerBridge controls', () => {
       await bridge.handle(message('/resume session-1'));
       await bridge.handle(message('Investigate latency'));
 
-      expect(adapter.sent.some((entry) => entry.text === 'Deep diving…')).toBe(true);
+      expect(adapter.sent.some((entry) => entry.text.startsWith('✦ Thinking'))).toBe(true);
+      await vi.advanceTimersByTimeAsync(1_600);
+      expect(adapter.edits.at(-1)?.text).toMatch(/^✧ Thinking…/);
       expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
         payload: expect.objectContaining({ mode: 'queue' }),
       }));
@@ -848,10 +1163,16 @@ describe('MessengerBridge controls', () => {
         type: 'tool/call',
         seq: 2,
         time: Date.now(),
-        data: { turn: 1, step: 1, callId: 'call-1', name: 'functions.bash', arguments: '{}' },
+        data: {
+          turn: 1,
+          step: 1,
+          callId: 'call-1',
+          name: 'functions.bash',
+          arguments: JSON.stringify({ command: 'pnpm test', description: 'Run the test suite' }),
+        },
       } as unknown as SessionEvent);
       await vi.advanceTimersByTimeAsync(800);
-      expect(adapter.edits.at(-1)?.text).toContain('🔧 functions.bash');
+      expect(adapter.edits.at(-1)?.text).toContain('Run the test suite…');
 
       await bridge.onSessionEvent('session-1', {
         type: 'assistant/chunk',
@@ -881,7 +1202,7 @@ describe('MessengerBridge controls', () => {
         data: { turn: 1, reason: { kind: 'completed' } },
       } as unknown as SessionEvent);
 
-      expect(adapter.edits.at(-1)?.text).toBe('Done quickly.');
+      await vi.waitFor(() => expect(adapter.edits.at(-1)?.text).toBe('Done quickly.'));
       expect(adapter.edits.at(-1)?.keyboard).toEqual([]);
       await bridge.dispose();
     } finally {
