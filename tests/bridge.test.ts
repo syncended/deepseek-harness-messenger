@@ -801,7 +801,7 @@ describe('MessengerBridge controls', () => {
     send.mockRestore();
     await bridge.handle(message('second try'));
 
-    expect(adapter.sent.filter((entry) => entry.text.startsWith('✦ Exploring'))).toHaveLength(1);
+    expect(adapter.sent.filter((entry) => entry.text.startsWith('Exploring…'))).toHaveLength(1);
     await bridge.dispose();
   });
 
@@ -1121,7 +1121,7 @@ describe('MessengerBridge controls', () => {
       time: Date.now(),
       data: { turn: 2 },
     } as unknown as SessionEvent);
-    expect(adapter.sent.some((entry) => entry.text.startsWith('✦ Exploring'))).toBe(true);
+    expect(adapter.sent.some((entry) => entry.text.startsWith('Exploring…'))).toBe(true);
     await bridge.dispose();
   });
 
@@ -1201,11 +1201,11 @@ describe('MessengerBridge controls', () => {
       bridge.registerAdapter(adapter);
       await bridge.handle(message('/resume session-1'));
       await bridge.handle(message('long investigation'));
-      const labels = [adapter.sent.at(-1)?.text.match(/^. (.+?)…/)?.[1]];
+      const labels = [adapter.sent.at(-1)?.text.match(/^(.+?)…/)?.[1]];
 
       for (let index = 1; index <= 16; index += 1) {
         await vi.advanceTimersByTimeAsync(4_800);
-        labels.push(adapter.edits.at(-1)?.text.match(/^. (.+?)…/)?.[1]);
+        labels.push(adapter.edits.at(-1)?.text.match(/^(.+?)…/)?.[1]);
       }
 
       expect(new Set(labels.slice(0, 16))).toHaveLength(16);
@@ -1288,9 +1288,9 @@ describe('MessengerBridge controls', () => {
       await bridge.handle(message('/resume session-1'));
       await bridge.handle(message('Investigate latency'));
 
-      expect(adapter.sent.some((entry) => entry.text.startsWith('✦ Thinking'))).toBe(true);
+      expect(adapter.sent.some((entry) => entry.text.startsWith('Thinking…'))).toBe(true);
       await vi.advanceTimersByTimeAsync(1_600);
-      expect(adapter.edits.at(-1)?.text).toMatch(/^✧ Thinking…/);
+      expect(adapter.edits.at(-1)?.text).toMatch(/^Thinking… ✧$/);
       expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
         payload: expect.objectContaining({ mode: 'queue' }),
       }));

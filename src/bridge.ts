@@ -381,7 +381,9 @@ function progressActivity(state: ProgressState): string {
   ]!;
   const label = active?.label ?? (state.phase === 'responding' ? 'Writing the response' : thinking);
   const startedAt = active?.startedAt ?? state.startedAt;
-  return `${spinner} ${label}…${elapsedSuffix(startedAt)}`;
+  // The animated spinner lives at the end of the line and the activity line is
+  // rendered last, so frame width changes never shift the message's leading text.
+  return `${label}…${elapsedSuffix(startedAt)} ${spinner}`;
 }
 
 function pushStatus(state: ProgressState, line: string): void {
@@ -452,8 +454,8 @@ function progressText(state: ProgressState): string {
   );
   const compose = (body: string): string => [
     body || placeholder,
-    activity && body ? activity : '',
     details,
+    activity && body ? activity : '',
   ].filter(Boolean).join('\n\n');
 
   const rendered = compose(renderBody(rawBody));
