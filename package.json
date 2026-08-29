@@ -18,6 +18,7 @@
     "dist",
     "lib/client.js",
     "cordis.patch.yml",
+    "docs/assets/telegram-settings.png",
     "README.md",
     "LICENSE"
   ],

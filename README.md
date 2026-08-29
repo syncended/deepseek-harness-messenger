@@ -2,6 +2,10 @@
 
 A bridge plugin between [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) and messaging platforms. Telegram Bot API is the initial transport, while the adapter boundary is designed for Yandex Messenger, Discord, and additional transports.
 
+<p align="center">
+  <img src="./docs/assets/telegram-settings.png" width="560" alt="Dark-theme Telegram configuration in DeepSeek Harness Messenger settings" />
+</p>
+
 ## Current features
 
 - a **Messengers** page in DSH Web Settings for Telegram setup;
@@ -50,36 +54,47 @@ When DSH calls `ask_user_question`, the bot pauses typing and shows the question
 
 ## Progressive responses
 
-A prompt receives an immediate `Deep diving…` placeholder and Telegram typing activity. As DSH events arrive, the plugin coalesces text chunks into throttled edits and reports bounded status such as:
+A prompt receives an immediate rotating activity placeholder and Telegram typing activity. As DSH events arrive, the plugin coalesces text chunks into throttled edits and reports bounded reasoning, tool, and checklist status without exposing hidden reasoning.
 
-- `💭 Reasoning…` without exposing hidden reasoning text;
-- `🔧 tool-name` when a tool starts;
-- `✅ tool-name` or `❌ tool-name` when it finishes;
-- compact checklist progress.
+Raw tool arguments, raw results, file contents, shell output, credentials, and opaque metadata are never mirrored automatically. An allowlist of sanitized contextual fields—such as a path, pattern, command description, query, or item name—may appear in a bounded tool summary. The final assistant response replaces the placeholder and is split safely when needed.
 
-Tool arguments, raw tool results, file contents, shell output, credentials, and opaque metadata are never mirrored automatically. The final assistant response replaces the placeholder and is split safely when needed.
+## Requirements
 
-## Development setup
+- Node.js 22 or newer.
+- DeepSeek Harness `0.1.1-rc.2` or a compatible Web profile.
+- A Telegram bot token from [BotFather](https://t.me/BotFather).
+- Outbound DNS and HTTPS access to `api.telegram.org` from the Harness host.
+- pnpm 10 through Corepack only for source development.
 
-Node.js 22+ and pnpm 10 are required.
+The adapter uses Telegram long polling. Remove any active webhook and stop other processes polling with the same token before enabling it. The plugin has no proxy setting of its own, so configure network egress at the host or runtime level.
 
-```bash
-pnpm install
-pnpm check
-pnpm test
-pnpm build
-```
+## Install
 
 Install the published package into a DSH Web profile:
+
+```bash
+dsh plugin --profile web add @syncended/dsh-messenger
+```
+
+If the pnpm-backed profile requires workspace-root handling or peer auto-installation must stay disabled:
 
 ```bash
 dsh plugin --profile web add -w --config.auto-install-peers=false @syncended/dsh-messenger
 ```
 
-For local development, install it from a checkout instead:
+For local development, install a checkout instead:
 
 ```bash
+pnpm install
+pnpm check
+
 dsh plugin --profile web add /absolute/path/to/deepseek-harness-messenger
+```
+
+Restart `dsh web` after installing or upgrading and refresh the existing GUI. To remove the plugin:
+
+```bash
+dsh plugin --profile web remove @syncended/dsh-messenger
 ```
 
 ## DSH configuration
@@ -90,16 +105,29 @@ The package exports [`cordis.patch.yml`](./cordis.patch.yml) as its DSH bundle a
 
 1. Restart the Web profile after installing or upgrading the package.
 2. Open **Settings → Messengers → Telegram**.
-3. Enter the bot token issued by [BotFather](https://t.me/BotFather). The token is written directly to the DSH credential store and is never saved in plugin settings.
+3. Enter the token issued by [BotFather](https://t.me/BotFather). It is written directly to the DSH credential store and never saved in plugin settings.
 4. Add at least one allowed numeric Telegram chat ID.
-5. Keep **Allow private chats only** enabled unless group access is required.
-6. Save, send `/start` to the bot, then choose **Sessions** or **New**.
+5. Keep **Allow private chats only** enabled unless group access is required. For groups, add explicit allowed operator user IDs as well.
+6. Turn on **Enable Telegram adapter** and save.
+7. Send `/start` to the bot, then choose **Sessions** or **New**.
 
-Settings changes apply live. Local reverse-proxy origins under the reserved `.localhost` suffix, for example `https://dsh.localhost`, are supported; requests still pass through the DSH Host API trust fence. A bot token can also come from the `TELEGRAM_BOT_TOKEN` environment variable; environment-provided credentials are intentionally read-only in the Web page.
+Settings changes apply live after the initial plugin restart. Local reverse-proxy origins under the reserved `.localhost` suffix, for example `https://dsh.localhost`, are supported; requests still pass through the DSH Host API trust fence. A bot token can also come from the `TELEGRAM_BOT_TOKEN` environment variable of the process launching `dsh web`; environment-provided credentials are intentionally read-only in the Web page.
+
+### Find Telegram chat and user IDs
+
+Before enabling this plugin's poller, send a message to the bot and call Telegram's official `getUpdates` endpoint once:
+
+```bash
+curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getUpdates"
+```
+
+Use `result[].message.chat.id` as an allowed chat ID and `result[].message.from.id` as an allowed operator user ID. Group chat IDs are normally negative. Do not paste bot tokens into third-party “ID finder” bots or websites.
+
+If `getUpdates` reports a webhook conflict, remove the webhook through the official Bot API before enabling long polling. In groups, review BotFather privacy mode: with privacy mode enabled, Telegram sends the bot commands and directed messages rather than every ordinary group message.
 
 ### Configure manually
 
-The same settings can be supplied in the Web profile patch:
+The same settings can be supplied by editing the existing `messenger` row in `$DSH_HOME/profiles/web/cordis.patch.yml` (normally `~/.dsh/profiles/web/cordis.patch.yml`). Do not add a duplicate row with the same id:
 
 ```yaml
 - id: messenger
@@ -115,9 +143,9 @@ The same settings can be supplied in the Web profile patch:
       requestTimeoutMs: 15000
 ```
 
-`tokenRef` contains only the reserved DSH credential reference `TELEGRAM_BOT_TOKEN`; the secret value belongs in the managed DSH credential store or an environment variable with that name. Other references are rejected.
+`tokenRef` contains only the reserved DSH credential reference `TELEGRAM_BOT_TOKEN`; the secret value belongs in the managed DSH credential store or an environment variable with that name. Other references are rejected. Restart the Host after manual YAML edits; Web settings changes apply live.
 
-> **Important:** the adapter is disabled by default. When enabled with an empty `allowedChatIds`, it ignores every incoming Telegram message. Group chats are disabled by default; to enable them, set `privateChatsOnly: false` and explicitly list authorized operators in `allowedUserIds`.
+> **Important:** the adapter is disabled by default and cannot be enabled until at least one allowed chat ID is configured. Group chats are disabled by default; to enable them, set `privateChatsOnly: false` and explicitly list authorized operators in `allowedUserIds`.
 
 ### Operator trust model
 
@@ -125,7 +153,7 @@ Every authorized Telegram operator is trusted as a Host-wide DSH operator. They 
 
 In a group, mirrored output is visible to every group member even though only IDs in `allowedUserIds` can issue commands. Use groups only when every participant may see the connected session.
 
-Inline callback payloads contain only opaque random one-use IDs. Actions are held in process memory, expire after ten minutes, and are bound to the originating transport, chat, operator, target session, and binding revision. Session IDs, paths, permission payloads, tool arguments, and credentials are not placed in Telegram callback data.
+Inline callback payloads contain only opaque random one-use IDs. Ordinary control actions are held in process memory for ten minutes; question options can remain valid for up to 24 hours. Every action is bound to the originating transport, chat, operator, target session, and binding revision. Session IDs, paths, permission payloads, tool arguments, and credentials are not placed in Telegram callback data.
 
 The credential reference is fixed to `TELEGRAM_BOT_TOKEN` so the plugin cannot resolve, overwrite, or remove credentials owned by another integration. Token values are checked for Telegram bot-token syntax before requests are sent.
 
@@ -134,6 +162,21 @@ The credential reference is fixed to `TELEGRAM_BOT_TOKEN` so the plugin cannot r
 Inbound updates use explicit at-most-once delivery. The adapter confirms an entire fetched batch with Telegram before scheduling any DSH side effect. Updates returned by that confirmation request are retained as the next batch rather than discarded. A process crash after confirmation can therefore require the operator to resend an update, but prompts and cancellations are not replayed automatically.
 
 Long-poll timeout does not add command latency: Telegram returns a waiting poll immediately when an update arrives, and zero-time confirmation calls use only `requestTimeoutMs`. Poll, confirmation, handler, and Bot API failures are logged; Telegram `retry_after` is honored. Confirmed process-local work is capped at 64 handlers; polling applies backpressure before confirming another batch. Per-chat message handlers keep deterministic order, while callback acknowledgements bypass blocked chat tails and their substantive actions remain serialized.
+
+### Troubleshooting
+
+- An enabled setting is not proof of connectivity. Check Host logs for token validation, DNS/TLS, webhook conflict, polling, and Bot API failures.
+- If messages are ignored, verify the numeric chat ID and, for groups, the sender's allowed user ID and `privateChatsOnly` setting.
+- If polling reports a conflict, stop the other poller or remove the active webhook.
+- If the Web page cannot write settings or credentials, connect directly to the Host or through a supported same-origin `.localhost` reverse proxy.
+
+## Development
+
+```bash
+pnpm install
+pnpm check
+npm pack --dry-run
+```
 
 ## Architecture
 
