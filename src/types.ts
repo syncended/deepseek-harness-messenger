@@ -27,9 +27,15 @@ export interface InboundCallbackInteraction extends InboundMessengerBase {
   readonly data: string;
 }
 
+export interface InboundGenerationStopped extends InboundMessengerBase {
+  readonly kind: 'generation_stopped';
+  readonly draftId: number;
+}
+
 export type InboundMessengerMessage =
   | InboundTextMessage
-  | InboundCallbackInteraction;
+  | InboundCallbackInteraction
+  | InboundGenerationStopped;
 
 export interface MessengerMessageHandle {
   readonly chatId: string;
@@ -60,6 +66,11 @@ export interface SendTextOptions {
   readonly keyboard?: MessengerInlineKeyboard;
 }
 
+export interface SendDraftOptions {
+  readonly canStop?: boolean;
+  readonly keepOnStop?: boolean;
+}
+
 export interface MessengerAdapter {
   readonly id: string;
   /** Maximum transport-measured characters accepted by an edited text message. */
@@ -84,6 +95,13 @@ export interface MessengerAdapter {
     messageId: string,
     text: string,
     keyboard?: MessengerInlineKeyboard,
+  ): Promise<void>;
+  /** Stream an ephemeral partial response when the transport supports native drafts. */
+  sendDraft?(
+    chatId: string,
+    draftId: number,
+    text: string,
+    options?: SendDraftOptions,
   ): Promise<void>;
   /** Replace one message and spill overflow into follow-up messages. */
   replaceText?(

@@ -3,10 +3,12 @@ import { MessengerBridge, parseCommand, type BridgeContext } from '../src/bridge
 import { splitTelegramText } from '../src/telegram.js';
 import type {
   InboundCallbackInteraction,
+  InboundGenerationStopped,
   InboundTextMessage,
   MessengerAdapter,
   MessengerInlineKeyboard,
   MessengerMessageHandle,
+  SendDraftOptions,
   SendTextOptions,
 } from '../src/types.js';
 import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api';
@@ -51,6 +53,30 @@ class FakeAdapter implements MessengerAdapter {
   }
 }
 
+class NativeDraftAdapter extends FakeAdapter {
+  readonly drafts: {
+    chatId: string;
+    draftId: number;
+    text: string;
+    options?: SendDraftOptions;
+  }[] = [];
+
+  async sendDraft(
+    chatId: string,
+    draftId: number,
+    text: string,
+    options?: SendDraftOptions,
+  ): Promise<void> {
+    this.order.push(`draft:${text}`);
+    this.drafts.push({
+      chatId,
+      draftId,
+      text,
+      ...(options === undefined ? {} : { options }),
+    });
+  }
+}
+
 function message(text: string, chatId = '100'): InboundTextMessage {
   return {
     kind: 'message',
@@ -74,6 +100,19 @@ function callback(data: string, senderId = '100'): InboundCallbackInteraction {
     text: data,
     data,
     callbackQueryId: randomId(),
+  };
+}
+
+function generationStopped(draftId: number): InboundGenerationStopped {
+  return {
+    kind: 'generation_stopped',
+    transport: 'telegram',
+    messageId: String(draftId),
+    chatId: '100',
+    chatKind: 'private',
+    senderId: '100',
+    text: '',
+    draftId,
   };
 }
 
@@ -875,6 +914,103 @@ describe('MessengerBridge controls', () => {
       'messenger: failed to start progress for one binding: %o',
       expect.anything(),
     );
+    await bridge.dispose();
+  });
+
+  it('uses native drafts for private-chat progress and persists the final answer', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ctx } = fakeContext();
+      const adapter = new NativeDraftAdapter();
+      const bridge = new MessengerBridge(ctx, {
+        allowedChatIds: ['100'],
+        allowedUserIds: [],
+        privateChatsOnly: true,
+      });
+      bridge.registerAdapter(adapter);
+      await bridge.handle(message('/resume session-1'));
+      const sentBeforePrompt = adapter.sent.length;
+
+      await bridge.handle(message('stream natively'));
+      expect(adapter.drafts).toHaveLength(1);
+      expect(adapter.drafts[0]?.options).toEqual({ canStop: true, keepOnStop: true });
+      expect(adapter.sent).toHaveLength(sentBeforePrompt);
+
+      await bridge.onSessionEvent('session-1', {
+        type: 'assistant/chunk',
+        seq: 1,
+        time: Date.now(),
+        data: {
+          turn: 1,
+          step: 1,
+          chunk: { type: 'text-delta', index: 0, text: 'Final answer.' },
+        },
+      } as unknown as SessionEvent);
+      await vi.advanceTimersByTimeAsync(800);
+
+      expect(adapter.drafts.at(-1)?.text).toContain('Final answer.');
+      expect(adapter.drafts.at(-1)?.draftId).toBe(adapter.drafts[0]?.draftId);
+      expect(adapter.edits).toHaveLength(0);
+
+      await bridge.onSessionEvent('session-1', {
+        type: 'turn/end',
+        seq: 2,
+        time: Date.now(),
+        data: { turn: 1, reason: { kind: 'completed' } },
+      } as unknown as SessionEvent);
+      await vi.waitFor(() => expect(adapter.sent.at(-1)?.text).toBe('Final answer.'));
+      expect(adapter.edits).toHaveLength(0);
+      await bridge.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps edited-message progress as the group-chat fallback', async () => {
+    const { ctx } = fakeContext();
+    const adapter = new NativeDraftAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['-100'],
+      allowedUserIds: ['200'],
+      privateChatsOnly: false,
+    });
+    bridge.registerAdapter(adapter);
+    const groupMessage = (text: string): InboundTextMessage => ({
+      ...message(text, '-100'),
+      chatKind: 'group',
+      senderId: '200',
+    });
+
+    await bridge.handle(groupMessage('/resume session-1'));
+    const sentBeforePrompt = adapter.sent.length;
+    await bridge.handle(groupMessage('use the fallback'));
+
+    expect(adapter.drafts).toHaveLength(0);
+    expect(adapter.sent).toHaveLength(sentBeforePrompt + 1);
+    expect(adapter.sent.at(-1)?.options?.keyboard?.[0]?.[0]?.text).toBe('Cancel');
+    await bridge.dispose();
+  });
+
+  it('maps Telegram native draft stop controls to session cancellation', async () => {
+    const { ctx, sessions, agent } = fakeContext();
+    (agent as { status: string }).status = 'running';
+    const adapter = new NativeDraftAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    });
+    bridge.registerAdapter(adapter);
+    await bridge.handle(message('/resume session-1'));
+    await bridge.handle(message('cancel from Telegram'));
+    const draftId = adapter.drafts[0]?.draftId;
+    expect(draftId).toBeTypeOf('number');
+
+    await bridge.handle(generationStopped(draftId!));
+
+    expect(sessions.cancel).toHaveBeenCalledWith(expect.objectContaining({
+      payload: { sessionId: 'session-1' },
+    }));
     await bridge.dispose();
   });
 
