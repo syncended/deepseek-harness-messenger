@@ -1258,6 +1258,11 @@ describe('MessengerBridge controls', () => {
       await vi.advanceTimersByTimeAsync(800);
       expect(adapter.edits.at(-1)?.text).toContain('✓ Searching for “progressText” in src');
 
+      // The status trail leads and the animated activity line stays at the tail.
+      const statusAndActivity = adapter.edits.at(-1)?.text ?? '';
+      expect(statusAndActivity.startsWith('✓ Searching for “progressText” in src')).toBe(true);
+      expect(statusAndActivity).toMatch(/… [✦✧✶✳✢]$/);
+
       const todoEvent = {
         type: 'todo/write',
         seq: 4,

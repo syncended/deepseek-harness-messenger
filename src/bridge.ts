@@ -444,7 +444,7 @@ function progressText(state: ProgressState): string {
   const rawBody = state.text.trim();
   const activity = state.turnEnded ? '' : progressActivity(state);
   const details = progressDetails(state);
-  const placeholder = state.turnEnded ? 'Finished.' : activity;
+  const placeholder = state.turnEnded ? 'Finished.' : '';
   const limit = state.adapter.textLimit ?? DEFAULT_PROGRESS_LIMIT;
   const measure = (value: string): number => (
     state.adapter.textLength?.(value) ?? Array.from(value).length
@@ -452,10 +452,12 @@ function progressText(state: ProgressState): string {
   const renderBody = (value: string): string => (
     value && state.adapter.renderText !== undefined ? state.adapter.renderText(value) : value
   );
+  // Response body leads; the status trail and the animated activity line are
+  // pinned to the message tail so the leading text never shifts mid-stream.
   const compose = (body: string): string => [
     body || placeholder,
     details,
-    activity && body ? activity : '',
+    activity,
   ].filter(Boolean).join('\n\n');
 
   const rendered = compose(renderBody(rawBody));
