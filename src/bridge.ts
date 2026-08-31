@@ -9,11 +9,9 @@ import { DshControl, sessionTitle, visibleAssistantText } from './control.js';
 import { splitTelegramText } from './telegram.js';
 import type {
   InboundCallbackInteraction,
-  InboundGenerationStopped,
   InboundMessengerMessage,
   InboundTextMessage,
   MessengerAdapter,
-  MessengerChatKind,
   MessengerInlineKeyboard,
   MessengerMessageHandle,
   ParsedCommand,
@@ -142,8 +140,6 @@ interface ProgressState {
   readonly sessionId: string;
   readonly startedAt: number;
   handle?: MessengerMessageHandle;
-  draftId?: number;
-  stopRequested: boolean;
   ready: Promise<void>;
   text: string;
   readonly status: string[];
@@ -177,10 +173,6 @@ export function parseCommand(text: string): ParsedCommand | undefined {
 
 function bindingKey(transport: string, chatId: string): string {
   return `${transport}:${chatId}`;
-}
-
-function newDraftId(): number {
-  return Number.parseInt(randomUUID().slice(0, 8), 16) % 2_147_483_647 || 1;
 }
 
 function shortId(sessionId: string): string {
@@ -490,7 +482,6 @@ export class MessengerBridge {
   private readonly privateChatsOnly: boolean;
   private readonly bindings = new Map<string, string>();
   private readonly bindingOperators = new Map<string, string>();
-  private readonly bindingChatKinds = new Map<string, MessengerChatKind>();
   private readonly bindingRevisions = new Map<string, number>();
   private readonly adapters = new Map<string, MessengerAdapter>();
   private readonly outboundQueues = new Map<string, Promise<unknown>>();
@@ -541,18 +532,12 @@ export class MessengerBridge {
       return;
     }
 
-    const key = bindingKey(adapter.id, message.chatId);
-    if (message.chatKind !== undefined) this.bindingChatKinds.set(key, message.chatKind);
-
     if (message.kind === 'callback_query') {
       await this.handleCallback(adapter, message);
       return;
     }
-    if (message.kind === 'generation_stopped') {
-      await this.handleGenerationStopped(adapter, message);
-      return;
-    }
 
+    const key = bindingKey(adapter.id, message.chatId);
     if (parseCommand(message.text) === undefined && !this.bindings.has(key)) {
       await adapter.sendText(
         message.chatId,
@@ -598,13 +583,7 @@ export class MessengerBridge {
       return;
     }
 
-    void this.beginProgress(
-      adapter,
-      message.chatId,
-      message.senderId,
-      sessionId,
-      message.chatKind,
-    )
+    void this.beginProgress(adapter, message.chatId, message.senderId, sessionId)
       .catch((error: unknown) => {
         this.ctx.logger.warn(
           'messenger: failed to show progress before submitting prompt: %o',
@@ -881,27 +860,6 @@ export class MessengerBridge {
     if (message.chatKind === 'private') return true;
     const senderIds = message.senderAliases ?? [message.senderId];
     return !this.privateChatsOnly && senderIds.some((id) => this.allowedUserIds.has(id));
-  }
-
-  private async handleGenerationStopped(
-    adapter: MessengerAdapter,
-    message: InboundGenerationStopped,
-  ): Promise<void> {
-    const state = [...this.progress.values()].find((candidate) => (
-      candidate.adapter === adapter
-      && candidate.chatId === message.chatId
-      && candidate.draftId === message.draftId
-    ));
-    if (state === undefined || state.stopRequested || state.finalizing) return;
-
-    state.stopRequested = true;
-    this.stopProgressTimers(state);
-    const cancelled = await this.control.cancel(state.sessionId);
-    if (cancelled) return;
-
-    state.turnEnded = true;
-    pushStatus(state, '⏹ Generation stopped');
-    await this.finalizeProgress(state);
   }
 
   private async handleCallback(
@@ -1907,7 +1865,6 @@ export class MessengerBridge {
     chatId: string,
     senderId: string,
     sessionId: string,
-    chatKind?: MessengerChatKind,
   ): Promise<ProgressState> {
     const key = `${bindingKey(adapter.id, chatId)}:${sessionId}`;
     const previous = this.progress.get(key);
@@ -1917,17 +1874,12 @@ export class MessengerBridge {
     }
     const thinkingOffset = this.nextThinkingOffset;
     this.nextThinkingOffset = (this.nextThinkingOffset + 1) % THINKING_LABELS.length;
-    const draftId = chatKind === 'private' && adapter.sendDraft !== undefined
-      ? newDraftId()
-      : undefined;
     const state: ProgressState = {
       key,
       adapter,
       chatId,
       sessionId,
       startedAt: Date.now(),
-      ...(draftId === undefined ? {} : { draftId }),
-      stopRequested: false,
       ready: Promise.resolve(),
       text: '',
       status: [],
@@ -1955,21 +1907,14 @@ export class MessengerBridge {
     }
     const initialText = progressText(state);
     state.lastRendered = initialText;
-    state.ready = draftId !== undefined && adapter.sendDraft !== undefined
-      ? adapter.sendDraft(chatId, draftId, initialText, {
-        canStop: true,
-        keepOnStop: true,
-      }).then(() => {
-        if (progressText(state) !== state.lastRendered) this.scheduleProgressEdits([state]);
-      })
-      : adapter.sendText(chatId, initialText, {
-        keyboard: callbackKeyboard([[
-          this.button(adapter.id, chatId, senderId, 'Cancel', { kind: 'cancel', sessionId }),
-        ]]),
-      }).then((handle) => {
-        state.handle = handle;
-        if (progressText(state) !== state.lastRendered) this.scheduleProgressEdits([state]);
-      });
+    state.ready = adapter.sendText(chatId, initialText, {
+      keyboard: callbackKeyboard([[
+        this.button(adapter.id, chatId, senderId, 'Cancel', { kind: 'cancel', sessionId }),
+      ]]),
+    }).then((handle) => {
+      state.handle = handle;
+      if (progressText(state) !== state.lastRendered) this.scheduleProgressEdits([state]);
+    });
     try {
       await state.ready;
       return state;
@@ -1988,13 +1933,7 @@ export class MessengerBridge {
       if (adapter === undefined) continue;
       const chatId = key.slice(separator + 1);
       const senderId = this.bindingOperators.get(key) ?? chatId;
-      void this.beginProgress(
-        adapter,
-        chatId,
-        senderId,
-        sessionId,
-        this.bindingChatKinds.get(key),
-      )
+      void this.beginProgress(adapter, chatId, senderId, sessionId)
         .catch((error: unknown) => {
           this.ctx.logger.warn(
             'messenger: failed to start progress for one binding: %o',
@@ -2014,12 +1953,7 @@ export class MessengerBridge {
 
   private scheduleProgressEdits(states: readonly ProgressState[]): void {
     for (const state of states) {
-      if (
-        state.finalizing
-        || state.stopRequested
-        || (state.handle === undefined && state.draftId === undefined)
-        || state.editTimer !== undefined
-      ) continue;
+      if (state.finalizing || state.handle === undefined || state.editTimer !== undefined) continue;
       state.editTimer = setTimeout(() => {
         state.editTimer = undefined;
         void this.flushProgress(state).catch((error: unknown) => this.logProgressError(error));
@@ -2029,7 +1963,7 @@ export class MessengerBridge {
   }
 
   private async flushProgress(state: ProgressState): Promise<void> {
-    if (state.finalizing || state.stopRequested) return;
+    if (state.finalizing) return;
     if (state.flushInFlight) {
       state.flushRequested = true;
       return;
@@ -2039,28 +1973,18 @@ export class MessengerBridge {
       do {
         state.flushRequested = false;
         await state.ready;
-        if (state.finalizing || state.stopRequested) return;
+        if (state.handle === undefined || state.finalizing) return;
         const rendered = progressText(state);
         if (rendered === state.lastRendered) continue;
-        if (state.draftId !== undefined && state.adapter.sendDraft !== undefined) {
-          await this.enqueueOutbound(state.key, () => state.adapter.sendDraft!(
-            state.chatId,
-            state.draftId!,
-            rendered,
-            { canStop: true, keepOnStop: true },
-          ));
-        } else {
-          if (state.handle === undefined) return;
-          const keyboard = state.turnEnded ? [] : undefined;
-          await this.enqueueOutbound(state.key, () => state.adapter.editText(
-            state.chatId,
-            state.handle!.messageId,
-            rendered,
-            keyboard,
-          ));
-        }
+        const keyboard = state.turnEnded ? [] : undefined;
+        await this.enqueueOutbound(state.key, () => state.adapter.editText(
+          state.chatId,
+          state.handle!.messageId,
+          rendered,
+          keyboard,
+        ));
         state.lastRendered = rendered;
-      } while (state.flushRequested && !state.finalizing && !state.stopRequested);
+      } while (state.flushRequested && !state.finalizing);
     } finally {
       state.flushInFlight = false;
     }
@@ -2080,12 +2004,7 @@ export class MessengerBridge {
       const finalText = rawFinalText
         ? state.adapter.renderText?.(rawFinalText) ?? rawFinalText
         : sourceFinalText;
-      if (state.draftId !== undefined) {
-        await this.enqueueOutbound(state.key, () => state.adapter.sendText(
-          state.chatId,
-          sourceFinalText,
-        ));
-      } else if (state.handle === undefined) {
+      if (state.handle === undefined) {
         await state.adapter.sendText(state.chatId, finalText);
       } else if (state.adapter.replaceText !== undefined) {
         await this.enqueueOutbound(state.key, () => state.adapter.replaceText!(
@@ -2125,12 +2044,7 @@ export class MessengerBridge {
   }
 
   private startAnimation(state: ProgressState): void {
-    if (
-      state.animationTimer !== undefined
-      || state.turnEnded
-      || state.finalizing
-      || state.stopRequested
-    ) return;
+    if (state.animationTimer !== undefined || state.turnEnded || state.finalizing) return;
     state.animationTimer = setInterval(() => {
       state.animationFrame += 1;
       void this.flushProgress(state).catch((error: unknown) => this.logProgressError(error));
@@ -2145,7 +2059,7 @@ export class MessengerBridge {
   }
 
   private startTyping(state: ProgressState): void {
-    if (state.typingTimer !== undefined || state.turnEnded || state.stopRequested) return;
+    if (state.typingTimer !== undefined || state.turnEnded) return;
     void state.adapter.sendTyping(state.chatId).catch((error: unknown) => this.logProgressError(error));
     state.typingTimer = setInterval(() => {
       void state.adapter.sendTyping(state.chatId).catch((error: unknown) => this.logProgressError(error));

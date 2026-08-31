@@ -54,9 +54,9 @@ When DSH calls `ask_user_question`, the bot pauses typing and shows the question
 
 ## Progressive responses
 
-In private chats, a prompt receives a native Telegram streaming draft through `sendMessageDraft`. Updates with one stable draft ID are animated by Telegram, and Bot API 10.3's native Stop control is mapped to DSH cancellation. The completed response is then persisted with `sendMessage`. Group chats retain the throttled `editMessageText` fallback because Telegram drafts are private-chat only.
+A prompt receives an immediate rotating activity placeholder and Telegram typing activity. As DSH events arrive, the plugin coalesces text chunks into throttled `editMessageText` updates and reports bounded reasoning, tool, and checklist status without exposing hidden reasoning.
 
-As DSH events arrive, the plugin reports bounded reasoning, tool, and checklist status without exposing hidden reasoning. Raw tool arguments, raw results, file contents, shell output, credentials, and opaque metadata are never mirrored automatically. An allowlist of sanitized contextual fields—such as a path, pattern, command description, query, or item name—may appear in a bounded tool summary. Final output is split safely when needed.
+Raw tool arguments, raw results, file contents, shell output, credentials, and opaque metadata are never mirrored automatically. An allowlist of sanitized contextual fields—such as a path, pattern, command description, query, or item name—may appear in a bounded tool summary. The final assistant response replaces the placeholder and is split safely when needed.
 
 ## Requirements
 

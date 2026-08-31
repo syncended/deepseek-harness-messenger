@@ -3,7 +3,6 @@ import type {
   MessengerAdapter,
   MessengerInlineKeyboard,
   MessengerMessageHandle,
-  SendDraftOptions,
   SendTextOptions,
 } from './types.js';
 
@@ -13,7 +12,7 @@ const MAX_RETRY_DELAY_MS = 30_000;
 const POLL_BATCH_LIMIT = 32;
 const MAX_PENDING_HANDLERS = 64;
 const HANDLER_DRAIN_TIMEOUT_MS = 5_000;
-const ALLOWED_UPDATES = ['message', 'callback_query', 'stopped_message_generation'] as const;
+const ALLOWED_UPDATES = ['message', 'callback_query'] as const;
 const BOT_COMMANDS = [
   { command: 'start', description: 'Start or show controls' },
   { command: 'menu', description: 'Show the control menu' },
@@ -57,17 +56,10 @@ interface TelegramCallbackQuery {
   readonly data?: string;
 }
 
-interface TelegramMessageGenerationStopped {
-  readonly chat: TelegramChat;
-  readonly message_thread_id?: number;
-  readonly draft_id: number;
-}
-
 interface TelegramUpdate {
   readonly update_id: number;
   readonly message?: TelegramMessage;
   readonly callback_query?: TelegramCallbackQuery;
-  readonly stopped_message_generation?: TelegramMessageGenerationStopped;
 }
 
 interface TelegramResponse<T> {
@@ -458,20 +450,6 @@ function inboundUpdate(
     };
   }
 
-  const stopped = update.stopped_message_generation;
-  if (stopped !== undefined) {
-    return {
-      kind: 'generation_stopped',
-      transport: 'telegram',
-      messageId: String(stopped.draft_id),
-      chatId: String(stopped.chat.id),
-      chatKind: stopped.chat.type,
-      senderId: String(stopped.chat.id),
-      text: '',
-      draftId: stopped.draft_id,
-    };
-  }
-
   const callback = update.callback_query;
   if (callback?.message === undefined || callback.data === undefined) {
     return undefined;
@@ -667,26 +645,6 @@ export class TelegramAdapter implements MessengerAdapter {
       throw new RangeError('Telegram edited text exceeds 4096 visible characters');
     }
     await this.editHtmlText(chatId, messageId, chunks[0]!, keyboard);
-  }
-
-  async sendDraft(
-    chatId: string,
-    draftId: number,
-    text: string,
-    options: SendDraftOptions = {},
-  ): Promise<void> {
-    const chunks = splitTelegramHtml(renderTelegramMarkdown(text));
-    if (chunks.length !== 1) {
-      throw new RangeError('Telegram draft text exceeds 4096 visible characters');
-    }
-    await this.call('sendMessageDraft', {
-      chat_id: chatId,
-      draft_id: draftId,
-      text: chunks[0]!,
-      parse_mode: 'HTML',
-      ...(options.canStop === undefined ? {} : { can_stop: options.canStop }),
-      ...(options.keepOnStop === undefined ? {} : { keep_on_stop: options.keepOnStop }),
-    });
   }
 
   async replaceText(

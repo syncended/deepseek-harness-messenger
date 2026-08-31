@@ -464,11 +464,7 @@ describe('TelegramAdapter interactions and transport methods', () => {
     expect(requests.some(({ operation }) => operation === 'setMyCommands')).toBe(true);
     expect(requests.find(({ operation, body }) => (
       operation === 'getUpdates' && body.timeout === 30
-    ))?.body.allowed_updates).toEqual([
-      'message',
-      'callback_query',
-      'stopped_message_generation',
-    ]);
+    ))?.body.allowed_updates).toEqual(['message', 'callback_query']);
     expect(requests).toContainEqual({
       operation: 'answerCallbackQuery',
       body: {
@@ -476,45 +472,6 @@ describe('TelegramAdapter interactions and transport methods', () => {
         text: 'Done',
         show_alert: true,
       },
-    });
-  });
-
-  it('parses native message-generation stop updates', async () => {
-    const controller = new AbortController();
-    const fetchMock = vi.fn<typeof globalThis.fetch>(async (input, init) => {
-      const operation = String(input).split('/').pop() ?? '';
-      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      if (operation === 'getUpdates' && body.timeout === 30) {
-        return jsonResponse([{
-          update_id: 13,
-          stopped_message_generation: {
-            chat: { id: 42, type: 'private' },
-            draft_id: 8675309,
-          },
-        }]);
-      }
-      if (operation === 'getUpdates') return jsonResponse([]);
-      if (operation === 'getMe') return jsonResponse({ id: 1, username: 'our_bot' });
-      return jsonResponse(true);
-    });
-    const adapter = adapterWith(fetchMock);
-    let received: Parameters<Parameters<TelegramAdapter['start']>[0]>[0]
-      | undefined;
-
-    await adapter.start(async (message) => {
-      received = message;
-      controller.abort();
-    }, controller.signal);
-
-    expect(received).toEqual({
-      kind: 'generation_stopped',
-      transport: 'telegram',
-      messageId: '8675309',
-      chatId: '42',
-      chatKind: 'private',
-      senderId: '42',
-      text: '',
-      draftId: 8675309,
     });
   });
 
@@ -562,26 +519,6 @@ describe('TelegramAdapter interactions and transport methods', () => {
       message_id: '9',
       text: '<b>Updated</b>\n<code>value</code>',
       parse_mode: 'HTML',
-    });
-  });
-
-  it('streams formatted drafts with native stop controls', async () => {
-    const fetchMock = vi.fn<typeof globalThis.fetch>(async () => jsonResponse(true));
-    const adapter = adapterWith(fetchMock);
-
-    await adapter.sendDraft('42', 99, '**Working** & safe', {
-      canStop: true,
-      keepOnStop: true,
-    });
-
-    expect(String(fetchMock.mock.calls[0]?.[0])).toContain('/sendMessageDraft');
-    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
-      chat_id: '42',
-      draft_id: 99,
-      text: '<b>Working</b> &amp; safe',
-      parse_mode: 'HTML',
-      can_stop: true,
-      keep_on_stop: true,
     });
   });
 
