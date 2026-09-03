@@ -1,10 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import type { Context } from '@deepseek-ai/cordis';
 import type { AgentRegistry } from '@deepseek-ai/dsh-agent';
-import type { ApiProxy, MuxFrame, RpcId } from '@deepseek-ai/dsh-host-apiproxy/api';
-import type { WorkspaceId } from '@deepseek-ai/dsh-host-apiproxy/api/workspace';
 import type { PermissionPresetService } from '@deepseek-ai/dsh-permission-presets';
 import type { SessionEvent } from '@deepseek-ai/dsh-session';
+import type {
+  AskUserQuestionAnswer,
+  AskUserQuestionItem,
+} from '@deepseek-ai/dsh-user-questions';
+import type { WorkspaceId, WorkspaceRegistry } from '@deepseek-ai/dsh-workspace';
+import type { SessionController } from '@deepseek-ai/dsh-api-session-controller';
 import { DshControl, sessionTitle, visibleAssistantText } from './control.js';
 import { splitTelegramText } from './telegram.js';
 import type {
@@ -49,7 +53,8 @@ const THINKING_LABEL_FRAME_SPAN = 3;
 
 export type BridgeContext = {
   readonly agents: AgentRegistry;
-  readonly apiProxy: ApiProxy;
+  readonly sessionController: SessionController;
+  readonly workspaceRegistry: WorkspaceRegistry;
   readonly permissionPresets: PermissionPresetService;
   readonly logger: Context['logger'];
 };
@@ -90,7 +95,7 @@ interface CallbackRecord {
   readonly action: CallbackAction;
 }
 
-type QuestionItem = Extract<MuxFrame, { type: 'question/requested' }>['questions'][number];
+type QuestionItem = AskUserQuestionItem;
 
 interface QuestionAnswerItem {
   readonly id: string;
@@ -99,9 +104,11 @@ interface QuestionAnswerItem {
 }
 
 interface PendingQuestionRequest {
-  readonly rpcId: RpcId;
+  readonly rpcId: string;
   readonly sessionId: string;
   readonly questions: readonly QuestionItem[];
+  readonly submit: (answer: AskUserQuestionAnswer) => Promise<boolean>;
+  readonly reject: (reason: unknown) => void;
 }
 
 interface PendingQuestionState extends PendingQuestionRequest {
@@ -688,17 +695,6 @@ export class MessengerBridge {
       return;
     }
 
-    if (event.type === 'todo/write') {
-      const completed = event.data.todos.filter((todo) => todo.status === 'completed').length;
-      for (const state of active) replaceStatus(
-        state,
-        '📋 Checklist ',
-        `📋 Checklist ${completed}/${event.data.todos.length}`,
-      );
-      this.scheduleProgressEdits(active);
-      return;
-    }
-
     if (event.type === 'turn/end') {
       for (const state of active) {
         state.turnEnded = true;
@@ -719,14 +715,66 @@ export class MessengerBridge {
     }
   }
 
-  async onQuestionRequested(
-    rpcId: RpcId,
+  async askQuestion(
     sessionId: string,
     questions: readonly QuestionItem[],
+    signal?: AbortSignal,
+  ): Promise<AskUserQuestionAnswer | undefined> {
+    if (this.disposed || !this.hasBindings(sessionId)) return undefined;
+    signal?.throwIfAborted();
+
+    const rpcId = `messenger-${randomUUID()}`;
+    let resolveAnswer!: (answer: AskUserQuestionAnswer) => void;
+    let rejectAnswer!: (reason: unknown) => void;
+    const answerPromise = new Promise<AskUserQuestionAnswer>((resolve, rejectPromise) => {
+      resolveAnswer = resolve;
+      rejectAnswer = rejectPromise;
+    });
+    let submitted = false;
+    const submit = async (answer: AskUserQuestionAnswer): Promise<boolean> => {
+      if (submitted) return false;
+      submitted = true;
+      resolveAnswer(answer);
+      return true;
+    };
+    const reject = (reason: unknown): void => {
+      if (submitted) return;
+      submitted = true;
+      rejectAnswer(reason);
+    };
+
+    await this.onQuestionRequested(rpcId, sessionId, questions, submit, reject);
+    if (!this.questionRequests.has(rpcId)) return undefined;
+
+    const abort = (): void => {
+      reject(signal?.reason ?? new Error('question request aborted'));
+      void this.onQuestionResolved(rpcId, 'cancelled');
+    };
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    try {
+      return await answerPromise;
+    } finally {
+      signal?.removeEventListener('abort', abort);
+    }
+  }
+
+  async onQuestionRequested(
+    rpcId: string,
+    sessionId: string,
+    questions: readonly QuestionItem[],
+    submit: (answer: AskUserQuestionAnswer) => Promise<boolean> = async () => false,
+    reject: (reason: unknown) => void = () => undefined,
   ): Promise<void> {
     if (this.disposed || questions.length === 0) return;
     const rpcKey = String(rpcId);
-    const request = this.questionRequests.get(rpcKey) ?? { rpcId, sessionId, questions };
+    const request = this.questionRequests.get(rpcKey) ?? {
+      rpcId,
+      sessionId,
+      questions,
+      submit,
+      reject,
+    };
     this.questionRequests.set(rpcKey, request);
 
     const progress = this.progressStates(sessionId);
@@ -757,7 +805,7 @@ export class MessengerBridge {
   }
 
   async onQuestionResolved(
-    questionRpcId: RpcId | string,
+    questionRpcId: string,
     outcome: 'answered' | 'cancelled' = 'answered',
   ): Promise<void> {
     const rpcId = String(questionRpcId);
@@ -840,6 +888,9 @@ export class MessengerBridge {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    for (const request of this.questionRequests.values()) {
+      request.reject(new Error('messenger bridge disposed'));
+    }
     for (const state of this.progress.values()) this.stopProgressTimers(state);
     this.progress.clear();
     this.callbacks.clear();
@@ -1377,7 +1428,7 @@ export class MessengerBridge {
     }
     let accepted: boolean;
     try {
-      accepted = await this.control.answerQuestion(state.rpcId, state.sessionId, { answers });
+      accepted = await state.submit({ answers });
     } catch (error) {
       await this.renderQuestion(state);
       throw error;

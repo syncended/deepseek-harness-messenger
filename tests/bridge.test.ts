@@ -9,12 +9,7 @@ import type {
   MessengerMessageHandle,
   SendTextOptions,
 } from '../src/types.js';
-import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api';
 import type { SessionEvent } from '@deepseek-ai/dsh-session';
-
-function ok<T>(value: T) {
-  return { rpcId: 'test-rpc', result: { ok: true as const, value } };
-}
 
 class FakeAdapter implements MessengerAdapter {
   readonly id = 'telegram';
@@ -117,7 +112,7 @@ function fakeContext() {
     failures: [],
   };
   const workspaces = [{
-    workspaceId: 'workspace-1',
+    id: 'workspace-1',
     path: '/workspace/project',
     title: 'Project',
     sessionIds: ['session-1'],
@@ -125,36 +120,43 @@ function fakeContext() {
     updatedAt: '2025-01-01T00:00:00.000Z',
   }];
   let listed = [summary];
-  const prompt = vi.fn(async () => ok({ accepted: true as const }));
-  const sessions = {
-    list: vi.fn(async () => ok({ items: listed })),
-    models: vi.fn(async () => ok(models)),
-    history: vi.fn(async () => ok({ events: [], hasMore: false, projections: summary.projections })),
-    create: vi.fn(async (input: { payload: { workspaceId?: string } }) => {
-      listed = [{ ...summary, sessionId: 'session-new' }];
-      return ok({ sessionId: 'session-new', workspaceId: input.payload.workspaceId });
-    }),
-    prompt,
-    cancel: vi.fn(async () => ok({ accepted: true as const })),
-    selectModel: vi.fn(async (request: { payload: { provider: string; model: string; reasoningEffort?: string } }) => ok({
-      selected: request.payload,
-    })),
-  };
-  const workspace = {
-    list: vi.fn(async () => ok({ items: workspaces, archivedSessionIds: [] })),
-  };
+  const prompt = vi.fn(async () => ({ accepted: true as const }));
   const agent = {
     id: 'session-1',
     status: 'idle',
+    options: models.current,
     session: { events: [] },
     cancel: vi.fn(),
   };
-  const respond = vi.fn(async (_request: unknown) => ({ accepted: true as const }));
+  const sessions = {
+    list: vi.fn(async () => ({ items: listed })),
+    resolveAgent: vi.fn(async () => ({ agent })),
+    modelCatalog: vi.fn(async () => ({
+      default: models.current,
+      routableProviders: ['deepseek'],
+      groups: models.groups,
+      failures: models.failures,
+    })),
+    create: vi.fn(async (input: { workspaceId?: string }) => {
+      listed = [{ ...summary, sessionId: 'session-new' }];
+      return { sessionId: 'session-new', workspaceId: input.workspaceId };
+    }),
+    prompt,
+    cancel: vi.fn(async () => ({ accepted: true as const })),
+    selectModel: vi.fn(async (request: { provider: string; model: string; reasoningEffort?: string }) => ({
+      selected: request,
+    })),
+  };
+  const workspace = {
+    list: vi.fn(() => workspaces),
+  };
+  const respond = vi.fn(async (_answer: unknown) => true);
   const ctx = {
     agents: {
       get: vi.fn((id: string) => id === 'session-1' ? agent : undefined),
     },
-    apiProxy: { sessions, workspace, respond },
+    sessionController: sessions,
+    workspaceRegistry: workspace,
     permissionPresets: {
       names: ['workspace-write'],
       defaultPreset: 'workspace-write',
@@ -186,6 +188,17 @@ function latestCallbackFor(adapter: FakeAdapter, text: string): string {
   const button = keyboard?.flat().find((candidate) => candidate.text.includes(text));
   if (button === undefined || !('callbackData' in button)) throw new Error(`callback button "${text}" missing`);
   return button.callbackData;
+}
+
+function submitWith(
+  respond: ReturnType<typeof vi.fn>,
+  rpcId: string,
+  sessionId = 'session-1',
+) {
+  return async (answer: unknown): Promise<boolean> => {
+    await respond({ rpcId, sessionId, answer });
+    return true;
+  };
 }
 
 describe('parseCommand', () => {
@@ -243,7 +256,7 @@ describe('MessengerBridge controls', () => {
     await bridge.handle(callback(callbackFor(adapter, 'Project')));
 
     expect(sessions.create).toHaveBeenCalledWith(expect.objectContaining({
-      payload: { workspaceId: 'workspace-1' },
+      workspaceId: 'workspace-1',
     }));
     expect(adapter.sent.some((entry) => entry.text.startsWith('Created '))).toBe(true);
     expect(adapter.sent.at(-1)?.text).toContain('📁 Project');
@@ -251,7 +264,7 @@ describe('MessengerBridge controls', () => {
 
   it('offers an explicit Host-default fallback when no workspace is registered', async () => {
     const { ctx, sessions, workspace } = fakeContext();
-    workspace.list.mockResolvedValueOnce(ok({ items: [], archivedSessionIds: [] }));
+    workspace.list.mockReturnValueOnce([]);
     const adapter = new FakeAdapter();
     const bridge = new MessengerBridge(ctx, {
       allowedChatIds: ['100'],
@@ -264,11 +277,11 @@ describe('MessengerBridge controls', () => {
 
     expect(adapter.sent.at(-1)?.text).toContain('No registered workspaces');
     await bridge.handle(callback(callbackFor(adapter, 'Host default')));
-    expect(sessions.create).toHaveBeenCalledWith(expect.objectContaining({ payload: {} }));
+    expect(sessions.create).toHaveBeenCalledWith({});
   });
 
   it('answers callbacks before resuming and rejects a replay', async () => {
-    const { ctx, sessions } = fakeContext();
+    const { ctx, sessions, agent } = fakeContext();
     const adapter = new FakeAdapter();
     const bridge = new MessengerBridge(ctx, {
       allowedChatIds: ['100'],
@@ -278,9 +291,9 @@ describe('MessengerBridge controls', () => {
     bridge.registerAdapter(adapter);
     await bridge.handle(message('/resume'));
     const data = firstCallback(adapter);
-    sessions.models.mockImplementationOnce(async () => {
+    sessions.resolveAgent.mockImplementationOnce(async () => {
       adapter.order.push('models');
-      return ok({ current: { provider: 'deepseek', model: 'deepseek-chat', reasoningEffort: 'high' }, routable: true, groups: [], failures: [] });
+      return { agent };
     });
 
     await bridge.handle(callback(data));
@@ -306,7 +319,7 @@ describe('MessengerBridge controls', () => {
 
     await bridge.handle(callback(data));
 
-    expect(sessions.models).toHaveBeenCalled();
+    expect(sessions.resolveAgent).toHaveBeenCalled();
   });
 
   it('accepts a group operator through a transport-provided sender alias', async () => {
@@ -388,7 +401,7 @@ describe('MessengerBridge controls', () => {
     expect(callbackFor(adapter, 'DeepSeek Chat')).toMatch(/^m:/);
   });
 
-  it('answers a single-select DSH question through apiProxy.respond', async () => {
+  it('answers a single-select DSH question through the Host waterfall', async () => {
     const { ctx, respond } = fakeContext();
     const adapter = new FakeAdapter();
     const bridge = new MessengerBridge(ctx, {
@@ -400,7 +413,7 @@ describe('MessengerBridge controls', () => {
     await bridge.handle(message('/resume session-1'));
     await bridge.handle(message('start a turn'));
 
-    await bridge.onQuestionRequested(RpcId('question-rpc-1'), 'session-1', [{
+    await bridge.onQuestionRequested('question-rpc-1', 'session-1', [{
       id: 'deploy',
       header: 'Confirm',
       question: 'Deploy now?',
@@ -408,22 +421,16 @@ describe('MessengerBridge controls', () => {
         { label: 'Deploy', description: 'Ship it' },
         { label: 'Wait' },
       ],
-    }]);
+    }], submitWith(respond, 'question-rpc-1'));
 
     expect(adapter.edits.some((entry) => entry.text.includes('Waiting for your answer'))).toBe(true);
     expect(adapter.sent.at(-1)?.text).toContain('Deploy now?');
     await bridge.handle(callback(callbackFor(adapter, 'Deploy')));
 
     expect(respond).toHaveBeenCalledWith({
-      type: 'client-response',
       rpcId: 'question-rpc-1',
-      result: {
-        ok: true,
-        value: {
-          sessionId: 'session-1',
-          answer: { answers: [{ id: 'deploy', selected: ['Deploy'] }] },
-        },
-      },
+      sessionId: 'session-1',
+      answer: { answers: [{ id: 'deploy', selected: ['Deploy'] }] },
     });
     expect(adapter.edits.at(-1)?.text).toBe('✅ Answer submitted.');
     await bridge.dispose();
@@ -443,7 +450,7 @@ describe('MessengerBridge controls', () => {
       await bridge.handle(message('/resume session-1'));
       vi.spyOn(adapter, 'sendText').mockRejectedValueOnce(new Error('temporary send failure'));
 
-      await bridge.onQuestionRequested(RpcId('question-retry'), 'session-1', [{
+      await bridge.onQuestionRequested('question-retry', 'session-1', [{
         id: 'retry',
         question: 'Visible after retry?',
       }]);
@@ -470,16 +477,16 @@ describe('MessengerBridge controls', () => {
     bridge.registerAdapter(adapter);
     await bridge.handle(message('/resume session-1'));
 
-    await bridge.onQuestionRequested(RpcId('question-rpc-first'), 'session-1', [{
+    await bridge.onQuestionRequested('question-rpc-first', 'session-1', [{
       id: 'first',
       question: 'First decision?',
       options: [{ label: 'First answer' }],
-    }]);
-    await bridge.onQuestionRequested(RpcId('question-rpc-second'), 'session-1', [{
+    }], submitWith(respond, 'question-rpc-first'));
+    await bridge.onQuestionRequested('question-rpc-second', 'session-1', [{
       id: 'second',
       question: 'Second decision?',
       options: [{ label: 'Second answer' }],
-    }]);
+    }], submitWith(respond, 'question-rpc-second'));
 
     expect(adapter.sent.at(-1)?.text).toContain('First decision?');
     expect(adapter.sent.some((entry) => entry.text.includes('Second decision?'))).toBe(false);
@@ -507,7 +514,7 @@ describe('MessengerBridge controls', () => {
     bridge.registerAdapter(adapter);
     await bridge.handle(message('/resume session-1'));
 
-    await bridge.onQuestionRequested(RpcId('question-rpc-2'), 'session-1', [{
+    await bridge.onQuestionRequested('question-rpc-2', 'session-1', [{
       id: 'name',
       question: 'Release name?',
     }, {
@@ -515,7 +522,7 @@ describe('MessengerBridge controls', () => {
       question: 'Which checks?',
       multiSelect: true,
       options: [{ label: 'Tests' }, { label: 'Lint' }],
-    }]);
+    }], submitWith(respond, 'question-rpc-2'));
     await bridge.handle(message('August release'));
     expect(adapter.edits.at(-1)?.text).toContain('Which checks?');
 
@@ -529,19 +536,14 @@ describe('MessengerBridge controls', () => {
     )).toBe(true);
     await bridge.handle(callback(latestCallbackFor(adapter, 'Submit')));
 
-    expect(respond).toHaveBeenCalledWith(expect.objectContaining({
+    expect(respond).toHaveBeenCalledWith({
       rpcId: 'question-rpc-2',
-      result: {
-        ok: true,
-        value: {
-          sessionId: 'session-1',
-          answer: { answers: [
-            { id: 'name', selected: [], custom: 'August release' },
-            { id: 'checks', selected: ['Tests'] },
-          ] },
-        },
-      },
-    }));
+      sessionId: 'session-1',
+      answer: { answers: [
+        { id: 'name', selected: [], custom: 'August release' },
+        { id: 'checks', selected: ['Tests'] },
+      ] },
+    });
     await bridge.dispose();
   });
 
@@ -559,7 +561,7 @@ describe('MessengerBridge controls', () => {
     });
     bridge.registerAdapter(adapter);
     await bridge.handle(message('/resume session-1'));
-    await bridge.onQuestionRequested(RpcId('question-utf16-limit'), 'session-1', [{
+    await bridge.onQuestionRequested('question-utf16-limit', 'session-1', [{
       id: 'first',
       question: 'Short question?',
     }, {
@@ -585,7 +587,7 @@ describe('MessengerBridge controls', () => {
     });
     bridge.registerAdapter(adapter);
     await bridge.handle(message('/resume session-1'));
-    await bridge.onQuestionRequested(RpcId('question-render-retry'), 'session-1', [{
+    await bridge.onQuestionRequested('question-render-retry', 'session-1', [{
       id: 'one',
       question: 'Question one?',
     }, {
@@ -612,12 +614,12 @@ describe('MessengerBridge controls', () => {
     });
     bridge.registerAdapter(adapter);
     await bridge.handle(message('/resume session-1'));
-    await bridge.onQuestionRequested(RpcId('question-toggle-rollback'), 'session-1', [{
+    await bridge.onQuestionRequested('question-toggle-rollback', 'session-1', [{
       id: 'checks',
       question: 'Select checks',
       multiSelect: true,
       options: [{ label: 'Tests' }],
-    }]);
+    }], submitWith(respond, 'question-toggle-rollback'));
     const submit = latestCallbackFor(adapter, 'Submit');
     vi.spyOn(adapter, 'editText').mockRejectedValueOnce(new Error('temporary edit failure'));
 
@@ -625,11 +627,7 @@ describe('MessengerBridge controls', () => {
     await bridge.handle(callback(submit));
 
     expect(respond).toHaveBeenCalledWith(expect.objectContaining({
-      result: expect.objectContaining({
-        value: expect.objectContaining({
-          answer: { answers: [{ id: 'checks', selected: [] }] },
-        }),
-      }),
+      answer: { answers: [{ id: 'checks', selected: [] }] },
     }));
     await bridge.dispose();
   });
@@ -644,7 +642,7 @@ describe('MessengerBridge controls', () => {
     });
     bridge.registerAdapter(adapter);
     await bridge.handle(message('/resume session-1'));
-    await bridge.onQuestionRequested(RpcId('question-resolution-race'), 'session-1', [{
+    await bridge.onQuestionRequested('question-resolution-race', 'session-1', [{
       id: 'one',
       question: 'First?',
     }, {
@@ -679,7 +677,7 @@ describe('MessengerBridge controls', () => {
     });
     bridge.registerAdapter(adapter);
     await bridge.handle(message('/resume session-1'));
-    await bridge.onQuestionRequested(RpcId('question-before-progress'), 'session-1', [{
+    await bridge.onQuestionRequested('question-before-progress', 'session-1', [{
       id: 'wait',
       question: 'Wait for me?',
     }]);
@@ -712,13 +710,13 @@ describe('MessengerBridge controls', () => {
     if (modelButton === undefined || !('callbackData' in modelButton)) {
       throw new Error('model button missing');
     }
-    const callsBefore = sessions.models.mock.calls.length;
+    const callsBefore = sessions.resolveAgent.mock.calls.length;
 
     await bridge.handle(message('/unbind'));
     await bridge.handle(callback(modelButton.callbackData));
 
     expect(adapter.answers.at(-1)?.text).toContain('stale');
-    expect(sessions.models).toHaveBeenCalledTimes(callsBefore);
+    expect(sessions.resolveAgent).toHaveBeenCalledTimes(callsBefore);
   });
 
   it('cancels through the canonical API that preserves queued work', async () => {
@@ -754,11 +752,9 @@ describe('MessengerBridge controls', () => {
 
     await expect(bridge.handle(message('first try'))).resolves.toBeUndefined();
     expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
-      payload: expect.objectContaining({
-        content: [{ type: 'text', text: 'first try' }],
-        mode: 'queue',
-      }),
-    }));
+      content: [{ type: 'text', text: 'first try' }],
+      mode: 'queue',
+    }), expect.any(AbortSignal));
     send.mockRestore();
     await bridge.handle(message('second try'));
 
@@ -787,10 +783,8 @@ describe('MessengerBridge controls', () => {
     const handling = bridge.handle(message('start immediately'));
     await vi.waitFor(() => expect(prompt).toHaveBeenCalled());
     expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
-      payload: expect.objectContaining({
-        content: [{ type: 'text', text: 'start immediately' }],
-      }),
-    }));
+      content: [{ type: 'text', text: 'start immediately' }],
+    }), expect.any(AbortSignal));
     release?.();
     await handling;
     await bridge.dispose();
@@ -811,7 +805,7 @@ describe('MessengerBridge controls', () => {
       await new Promise<void>((resolve) => {
         release = resolve;
       });
-      return ok({ accepted: true as const });
+      return { accepted: true as const };
     });
 
     const admitted = bridge.handle(message('blocked prompt'));
@@ -1177,16 +1171,6 @@ describe('MessengerBridge controls', () => {
       expect(statusAndActivity.startsWith('✓ Searching for “progressText” in src')).toBe(true);
       expect(statusAndActivity).toMatch(/… [✦✧✶✳✢]$/);
 
-      const todoEvent = {
-        type: 'todo/write',
-        seq: 4,
-        time: Date.now(),
-        data: { todos: [{ content: 'Check it', status: 'in_progress' }] },
-      } as unknown as SessionEvent;
-      await bridge.onSessionEvent('session-1', todoEvent);
-      await bridge.onSessionEvent('session-1', todoEvent);
-      await vi.advanceTimersByTimeAsync(800);
-      expect(adapter.edits.at(-1)?.text.match(/Checklist 0\/1/g)).toHaveLength(1);
       await bridge.dispose();
     } finally {
       vi.useRealTimers();
@@ -1211,8 +1195,8 @@ describe('MessengerBridge controls', () => {
       await vi.advanceTimersByTimeAsync(1_600);
       expect(adapter.edits.at(-1)?.text).toMatch(/^Thinking… ✧$/);
       expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
-        payload: expect.objectContaining({ mode: 'queue' }),
-      }));
+        mode: 'queue',
+      }), expect.any(AbortSignal));
 
       await bridge.onSessionEvent('session-1', {
         type: 'tool/call',

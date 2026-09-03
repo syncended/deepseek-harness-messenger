@@ -20,7 +20,7 @@ A bridge plugin between [DeepSeek Harness](https://github.com/deepseek-ai/deepse
 - interactive `ask_user_question` choices, multi-select, and free-text answers;
 - context pressure, composition, and cumulative token-usage visibility;
 - follow-up, steering, and turn cancellation controls;
-- Claude-style animated progress, typing activity, streamed message edits, and contextual tool/checklist status;
+- Claude-style animated progress, typing activity, streamed message edits, and contextual tool status;
 - safe Telegram Markdown rendering for headings, emphasis, code, links, quotes, and lists;
 - formatting-preserving splitting at Telegram's 4096-character limit;
 - low-latency batch polling without per-chat head-of-line blocking;
@@ -61,7 +61,7 @@ Raw tool arguments, raw results, file contents, shell output, credentials, and o
 ## Requirements
 
 - Node.js 22 or newer.
-- DeepSeek Harness `0.1.1-rc.2` or a compatible Web profile.
+- DeepSeek Harness `0.1.2-rc.1` or a compatible Web profile.
 - A Telegram bot token from [BotFather](https://t.me/BotFather).
 - Outbound DNS and HTTPS access to `api.telegram.org` from the Harness host.
 - pnpm 10 through Corepack only for source development.
@@ -182,16 +182,18 @@ npm pack --dry-run
 
 ```text
 TelegramAdapter ─┐
-YandexAdapter  ──┼─> MessengerBridge ─> Host ApiProxy / Agent services
+YandexAdapter  ──┼─> MessengerBridge ─> Session / Workspace controllers
 DiscordAdapter ──┘          ^                        |
-                            └──── session/event ─────┘
+                            ├──── session/event ─────┘
+                            └─ user-question waterfall
 ```
 
 - An adapter owns only platform protocol, polling, callback acknowledgement, and message primitives.
 - `MessengerBridge` owns authorization, opaque callback actions, process-local bindings, controls, and progressive presentation.
-- The existing Host `apiProxy` provides canonical persisted-session create/resume, prompt, and model-selection paths.
+- The Host Session Controller provides canonical persisted-session create/resume, prompt, and model-selection paths; the Workspace Registry provides the local workspace roster.
+- The messenger registers a prepended `user-questions/request` waterfall answerer and delegates when no Telegram binding can accept the question.
 - DSH's permission-preset service performs permission changes; the plugin does not bypass sandbox or approval policy APIs.
-- Durable `session/event` records drive streamed text, tool status, checklist state, and final output.
+- Durable `session/event` records drive streamed text, tool status, and final output.
 
 Bindings and callback actions are currently process-local and reset when the plugin restarts.
 
