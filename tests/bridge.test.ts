@@ -201,6 +201,104 @@ function submitWith(
   };
 }
 
+describe('MessengerBridge notifications', () => {
+  async function setup(chats = ['100']) {
+    const { ctx } = fakeContext();
+    const adapter = new FakeAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: chats,
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    });
+    bridge.registerAdapter(adapter);
+    for (const chat of chats) await bridge.handle(message('/resume session-1', chat));
+    adapter.sent.length = 0;
+    return { bridge, adapter };
+  }
+
+  it('sends separate rendered messages to all and only the current session bindings', async () => {
+    const { bridge, adapter } = await setup(['100', '200']);
+    const render = vi.fn((text: string) => `rendered:${text}`);
+    Object.assign(adapter, { renderText: render });
+    expect(await bridge.notify('session-1', '**Done**')).toEqual({ sent: 2, failed: 0, skipped: 0 });
+    expect(adapter.sent).toEqual([
+      { chatId: '100', text: 'rendered:**Done**' },
+      { chatId: '200', text: 'rendered:**Done**' },
+    ]);
+    expect(adapter.edits).toEqual([]);
+    await expect(bridge.notify('other-session', 'No')).rejects.toThrow('No messenger chat');
+    await bridge.dispose();
+  });
+
+  it('rejects blank, oversized, unbound, disposed and already cancelled sends', async () => {
+    const { bridge, adapter } = await setup();
+    await expect(bridge.notify('session-1', '  ')).rejects.toThrow('not be blank');
+    await expect(bridge.notify('session-1', 'x'.repeat(16_001))).rejects.toThrow('16000');
+    await expect(bridge.notify('session-1', 'No', AbortSignal.abort())).rejects.toThrow();
+    expect(adapter.sent).toEqual([]);
+    await bridge.handle(message('/unbind'));
+    await expect(bridge.notify('session-1', 'No')).rejects.toThrow('No messenger chat');
+    await bridge.dispose();
+    await expect(bridge.notify('session-1', 'No')).rejects.toThrow('disposed');
+  });
+
+  it('reports partial failures without exposing transport errors or retrying delivered messages', async () => {
+    const { bridge, adapter } = await setup(['100', '200']);
+    vi.spyOn(adapter, 'sendText').mockImplementation(async (chatId) => {
+      if (chatId === '100') throw new Error('secret transport error');
+      return { chatId, messageId: '1' };
+    });
+    expect(await bridge.notify('session-1', 'Done')).toEqual({ sent: 1, failed: 1, skipped: 0 });
+    expect(adapter.sendText).toHaveBeenCalledTimes(2);
+    await bridge.dispose();
+  });
+
+  it.each(['cancel', 'dispose'])('skips queued sends on %s', async (action) => {
+    const { bridge, adapter } = await setup();
+    let release!: () => void;
+    let started!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const entered = new Promise<void>((resolve) => { started = resolve; });
+    const original = adapter.sendText.bind(adapter);
+    vi.spyOn(adapter, 'sendText').mockImplementation(async (chatId, text, options) => {
+      if (text === 'First') { started(); await blocked; }
+      return original(chatId, text, options);
+    });
+    const first = bridge.notify('session-1', 'First');
+    await entered;
+    const controller = new AbortController();
+    const second = bridge.notify('session-1', 'Second', controller.signal);
+    const stopping = action === 'dispose' ? bridge.dispose() : undefined;
+    if (action === 'cancel') controller.abort();
+    release();
+    await first;
+    expect(await second).toEqual({ sent: 0, failed: 0, skipped: 1 });
+    expect(adapter.sent.some((item) => item.text === 'Second')).toBe(false);
+    await stopping;
+    await bridge.dispose();
+  });
+
+  it('drops queued notifications after unbinding and rebinding the same session', async () => {
+    const { bridge, adapter } = await setup();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const original = adapter.sendText.bind(adapter);
+    vi.spyOn(adapter, 'sendText').mockImplementation(async (chatId, text, options) => {
+      if (text === 'First') await blocked;
+      return original(chatId, text, options);
+    });
+    const first = bridge.notify('session-1', 'First');
+    const second = bridge.notify('session-1', 'Second');
+    await bridge.handle(message('/unbind'));
+    await bridge.handle(message('/resume session-1'));
+    release();
+    await first;
+    expect(await second).toEqual({ sent: 0, failed: 0, skipped: 1 });
+    expect(adapter.sent.some((item) => item.text === 'Second')).toBe(false);
+    await bridge.dispose();
+  });
+});
+
 describe('parseCommand', () => {
   it('parses commands without trusting Telegram bot suffixes', () => {
     expect(parseCommand(' /Use@my_bot  session-42 ')).toEqual({

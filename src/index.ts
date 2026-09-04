@@ -7,6 +7,7 @@ import type {} from '@deepseek-ai/dsh-workspace';
 import z from '@deepseek-ai/schemastery';
 import { MessengerBridge } from './bridge.js';
 import { TelegramAdapter } from './telegram.js';
+import { installNotificationTool } from './notifications.js';
 
 export { MessengerBridge, parseCommand } from './bridge.js';
 export { TelegramAdapter, TelegramApiError, splitTelegramText } from './telegram.js';
@@ -24,6 +25,7 @@ export const inject = [
   'credentials',
   'permissionPresets',
   'settings',
+  'tools',
 ];
 export const MESSENGER_SETTINGS_NAMESPACE = 'messenger';
 
@@ -63,6 +65,7 @@ export const Config: z<Config> = z.object({
 });
 
 interface TelegramRuntime {
+  readonly bridge: MessengerBridge | undefined;
   stop(): Promise<void>;
 }
 
@@ -202,7 +205,10 @@ async function startTelegramRuntime(
     TELEGRAM_BOT_TOKEN_REF,
   );
 
-  return { stop };
+  return {
+    get bridge() { return stopped ? undefined : bridge; },
+    stop,
+  };
 }
 
 export function validateMessengerConfig(config: Config): void {
@@ -235,6 +241,8 @@ export async function apply(ctx: Context, entryConfig: Config): Promise<void> {
   let disposed = false;
   let generation = 0;
   let tail: Promise<void> = Promise.resolve();
+
+  installNotificationTool(ctx, () => disposed ? undefined : active?.bridge);
 
   const reconcile = (): Promise<void> => {
     const requestedGeneration = ++generation;

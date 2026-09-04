@@ -52,6 +52,20 @@ Telegram group commands addressed as `/command@bot_username` are accepted only w
 
 When DSH calls `ask_user_question`, the bot pauses typing and shows the question with native option buttons. Single-select, multi-select, free-text answers, batched questions, cancellation, reconnect replay, and concurrent pending questions are supported.
 
+## Agent notifications
+
+The `messenger_notify` tool sends a standalone message to every messenger chat currently bound to the calling agent's session:
+
+```json
+{ "text": "The build is ready. You can review the result." }
+```
+
+Bind the session first with `/resume` or `/new` in Telegram. Notifications also work when that session is driven from DSH Web rather than Telegram. The tool accepts only text (non-blank, at most 16,000 characters); session and recipient IDs cannot be supplied by the model. Subagents do not inherit their parent's bindings. In a bound group, **every group member can see notifications**.
+
+Use it for explicitly requested notifications or useful milestones, not to duplicate the normal final response or send secrets. Markdown rendering and Telegram message splitting are handled by the adapter. This is an immediate send, not a scheduler, and does not wait for a reply; use `ask_user_question` for questions.
+
+The result reports counts of `sent`, `failed`, and `skipped` chats. A failed multi-part send may already have delivered some text; do not blindly retry partial failures. `sent` means the transport accepted the message, not that the user read it. Queued notifications are skipped if the binding changes, the call is cancelled, or the bridge stops before sending; already-started sends cannot be recalled and multi-part sends may finish after cancellation or unbinding. With no active adapter or binding, the tool returns an error. Bindings reset on plugin restart or successful live reconfiguration; use `/resume` again.
+
 ## Progressive responses
 
 A prompt receives an immediate rotating activity placeholder and Telegram typing activity. As DSH events arrive, the plugin coalesces text chunks into throttled `editMessageText` updates and reports bounded reasoning, tool, and checklist status without exposing hidden reasoning.

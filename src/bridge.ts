@@ -715,6 +715,44 @@ export class MessengerBridge {
     }
   }
 
+  /** Send a standalone notification only to this session's current bindings. */
+  async notify(
+    sessionId: string,
+    text: string,
+    signal?: AbortSignal,
+  ): Promise<{ sent: number; failed: number; skipped: number }> {
+    if (this.disposed) throw new Error('Messenger bridge is disposed.');
+    if (!text.trim() || text.length > 16_000) {
+      throw new Error('Notification text must contain 1–16000 characters and not be blank.');
+    }
+    signal?.throwIfAborted();
+    const sends: Promise<boolean>[] = [];
+    for (const [key, boundSessionId] of this.bindings) {
+      if (boundSessionId !== sessionId) continue;
+      const separator = key.indexOf(':');
+      const adapter = this.adapters.get(key.slice(0, separator));
+      if (adapter === undefined) continue;
+      const revision = this.bindingRevisions.get(key);
+      sends.push(this.enqueueOutbound(key, async () => {
+        // A queued send must not outlive unbind/rebind, shutdown, or cancellation.
+        if (this.disposed || signal?.aborted
+          || this.bindings.get(key) !== sessionId
+          || this.bindingRevisions.get(key) !== revision) return false;
+        await adapter.sendText(key.slice(separator + 1), adapter.renderText?.(text) ?? text);
+        return true;
+      }));
+    }
+    if (sends.length === 0) {
+      throw new Error('No messenger chat is bound to this session. Use /resume or /new in the bot first.');
+    }
+    const results = await Promise.allSettled(sends);
+    return {
+      sent: results.filter((result) => result.status === 'fulfilled' && result.value).length,
+      failed: results.filter((result) => result.status === 'rejected').length,
+      skipped: results.filter((result) => result.status === 'fulfilled' && !result.value).length,
+    };
+  }
+
   async askQuestion(
     sessionId: string,
     questions: readonly QuestionItem[],
