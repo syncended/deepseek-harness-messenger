@@ -11,6 +11,7 @@ import type { WorkspaceId, WorkspaceRegistry } from '@deepseek-ai/dsh-workspace'
 import type { SessionController } from '@deepseek-ai/dsh-api-session-controller';
 import { DshControl, sessionTitle, visibleAssistantText } from './control.js';
 import { splitTelegramText } from './telegram.js';
+import type { NotificationStore, Subscription } from './notification-store.js';
 import type {
   InboundCallbackInteraction,
   InboundMessengerMessage,
@@ -60,6 +61,7 @@ export type BridgeContext = {
 };
 
 export interface MessengerBridgeOptions {
+  readonly notificationStore?: NotificationStore;
   readonly allowedChatIds: readonly string[];
   readonly allowedUserIds: readonly string[];
   readonly privateChatsOnly: boolean;
@@ -231,6 +233,7 @@ function helpText(): string {
     '/steer <text> — steer the active turn',
     '/cancel — cancel the active turn',
     '/unbind — remove the binding',
+    '/notifications on|off — enable or disable persistent Host-wide notifications',
     '/help — show this help',
     '',
     'Any other text is sent to the bound DSH session.',
@@ -501,6 +504,7 @@ export class MessengerBridge {
   private readonly questionRetryDelays = new Map<string, number>();
   private readonly resolvingQuestions = new Set<string>();
   private readonly control: DshControl;
+  private readonly notificationStore: NotificationStore | undefined;
   private nextThinkingOffset = 0;
   private disposed = false;
 
@@ -512,6 +516,7 @@ export class MessengerBridge {
     this.allowedUserIds = new Set(options.allowedUserIds);
     this.privateChatsOnly = options.privateChatsOnly;
     this.control = new DshControl(ctx);
+    this.notificationStore = options.notificationStore;
   }
 
   registerAdapter(adapter: MessengerAdapter): void {
@@ -561,6 +566,10 @@ export class MessengerBridge {
     message: InboundTextMessage,
   ): Promise<void> {
     const command = parseCommand(message.text);
+    if (command?.name === 'notifications') {
+      await this.handleNotificationsCommand(adapter, message, command.argument);
+      return;
+    }
     if (command !== undefined) {
       await this.handleCommand(adapter, message.chatId, message.senderId, command);
       return;
@@ -715,7 +724,85 @@ export class MessengerBridge {
     }
   }
 
-  /** Send a standalone notification only to this session's current bindings. */
+  private notificationRecipients(): Subscription[] {
+    return [...this.adapters.keys()].flatMap((transport) => this.notificationStore?.list(transport) ?? [])
+      .filter((subscription) => this.authorized(subscription));
+  }
+
+  canNotify(sessionId: string): boolean {
+    return !this.disposed && (this.notificationStore === undefined
+      ? this.hasBindings(sessionId) : this.notificationRecipients().length > 0);
+  }
+
+  private async handleNotificationsCommand(
+    adapter: MessengerAdapter,
+    message: InboundTextMessage,
+    argument: string,
+  ): Promise<void> {
+    const store = this.notificationStore;
+    if (store === undefined) {
+      await adapter.sendText(message.chatId, 'Persistent notifications are unavailable.');
+      return;
+    }
+    let response: string;
+    try {
+      switch (argument.toLowerCase()) {
+        case 'on':
+          await store.subscribe(message);
+          response = '🔔 Notifications enabled for this chat. Any automation or top-level session on this DSH Host can send status here, regardless of the selected session. '
+            + 'Everyone in a group can read them. The subscription survives restarts and /unbind. '
+            + 'Use /notifications off to unsubscribe.';
+          break;
+        case 'off':
+          await store.unsubscribe(adapter.id, message.chatId);
+          response = '🔕 Notifications disabled for this chat. Old notification buttons are now invalid.';
+          break;
+        default: {
+          const subscribed = store.get(adapter.id, message.chatId) !== undefined;
+          response = `Notifications: ${subscribed ? 'on' : 'off'}.\n/notifications on — receive Host-wide automation statuses without selecting a session.\n/notifications off — unsubscribe.\nOpening a notification session is always an explicit button click.`;
+        }
+      }
+    } catch (error) {
+      this.ctx.logger.warn('messenger: notification subscription could not be saved: %o', error);
+      await adapter.sendText(message.chatId, 'Could not save notification preferences. Please try again.');
+      return;
+    }
+    // A failed acknowledgement must not misreport a successfully persisted subscription.
+    await adapter.sendText(message.chatId, response);
+  }
+
+  private async notifySubscribers(
+    sessionId: string,
+    text: string,
+    signal?: AbortSignal,
+  ): Promise<{ sent: number; failed: number; skipped: number }> {
+    const store = this.notificationStore!;
+    const recipients = this.notificationRecipients();
+    if (recipients.length === 0) throw new Error('No notification subscribers. Send /notifications on in an allowed bot chat first.');
+    const sends = recipients.map((subscription) => this.enqueueOutbound(
+      bindingKey(subscription.transport, subscription.chatId),
+      async () => {
+        const current = () => !this.disposed && !signal?.aborted
+          && store.get(subscription.transport, subscription.chatId)?.id === subscription.id;
+        if (!current()) return false;
+        const token = await store.createLink(subscription, sessionId);
+        if (!current()) return false;
+        const adapter = this.adapters.get(subscription.transport)!;
+        await adapter.sendText(subscription.chatId, adapter.renderText?.(text) ?? text, {
+          keyboard: [[{ text: 'Открыть сессию', callbackData: `n:${token}` }]],
+        });
+        return true;
+      },
+    ));
+    const results = await Promise.allSettled(sends);
+    return {
+      sent: results.filter((result) => result.status === 'fulfilled' && result.value).length,
+      failed: results.filter((result) => result.status === 'rejected').length,
+      skipped: results.filter((result) => result.status === 'fulfilled' && !result.value).length,
+    };
+  }
+
+  /** Send to durable subscribers; standalone library bridges without a store retain legacy binding delivery. */
   async notify(
     sessionId: string,
     text: string,
@@ -726,6 +813,7 @@ export class MessengerBridge {
       throw new Error('Notification text must contain 1–16000 characters and not be blank.');
     }
     signal?.throwIfAborted();
+    if (this.notificationStore !== undefined) return this.notifySubscribers(sessionId, text, signal);
     const sends: Promise<boolean>[] = [];
     for (const [key, boundSessionId] of this.bindings) {
       if (boundSessionId !== sessionId) continue;
@@ -944,17 +1032,52 @@ export class MessengerBridge {
     ]);
   }
 
-  private authorized(message: InboundMessengerMessage): boolean {
+  private authorized(message: Pick<Subscription, 'chatId' | 'chatKind' | 'senderId' | 'senderAliases'>): boolean {
     if (!this.allowedChatIds.has(message.chatId)) return false;
     if (message.chatKind === 'private') return true;
     const senderIds = message.senderAliases ?? [message.senderId];
     return !this.privateChatsOnly && senderIds.some((id) => this.allowedUserIds.has(id));
   }
 
+  private async handleNotificationCallback(
+    adapter: MessengerAdapter,
+    message: InboundCallbackInteraction,
+  ): Promise<void> {
+    const store = this.notificationStore;
+    const token = message.data.slice(2);
+    const link = store?.link(token);
+    const valid = () => link !== undefined && store?.link(token) !== undefined
+      && link.transport === adapter.id && link.chatId === message.chatId
+      && link.senderId === message.senderId
+      && store.get(adapter.id, message.chatId)?.id === link.subscriptionId;
+    if (!valid() || link === undefined) {
+      await adapter.answerCallback(message.callbackQueryId, 'This notification expired or belongs to another subscriber.', true);
+      return;
+    }
+    try {
+      await adapter.answerCallback(message.callbackQueryId);
+    } catch (error) {
+      this.ctx.logger.warn('messenger: failed to acknowledge notification button: %o', error);
+    }
+    await this.enqueueAction(bindingKey(adapter.id, message.chatId), async () => {
+      if (!valid()) return;
+      try {
+        await this.bindSession(adapter, message.chatId, message.senderId, link.sessionId, valid);
+      } catch (error) {
+        this.ctx.logger.warn('messenger: could not open notification session: %o', error);
+        await adapter.sendText(message.chatId, 'Could not open the notification session. It may have been deleted or the subscription changed. Use /resume to choose another session.');
+      }
+    });
+  }
+
   private async handleCallback(
     adapter: MessengerAdapter,
     message: InboundCallbackInteraction,
   ): Promise<void> {
+    if (message.data.startsWith('n:')) {
+      await this.handleNotificationCallback(adapter, message);
+      return;
+    }
     const token = message.data.startsWith('m:') ? message.data.slice(2) : '';
     const record = this.callbacks.get(token);
     if (record === undefined || record.expiresAt < Date.now()) {
@@ -1531,6 +1654,7 @@ export class MessengerBridge {
     chatId: string,
     senderId: string,
     sessionId: string,
+    stillValid: () => boolean = () => true,
   ): Promise<void> {
     const sessions = await this.control.listSessions();
     if (!sessions.some((session) => String(session.sessionId) === sessionId)) {
@@ -1538,6 +1662,7 @@ export class MessengerBridge {
     }
     // Reading the model directory uses the canonical resume path for dormant sessions.
     await this.control.models(sessionId);
+    if (this.disposed || !stillValid()) throw new Error('This session control is no longer active.');
     const key = bindingKey(adapter.id, chatId);
     const previousQuestion = this.pendingQuestions.get(key);
     if (previousQuestion !== undefined) this.clearQuestionCallbacks(previousQuestion);

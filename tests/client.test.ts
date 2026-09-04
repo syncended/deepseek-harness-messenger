@@ -1,12 +1,15 @@
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 const CLIENT_SOURCE = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
 
 interface ClientDefinition {
   id: string;
   factory: (require: (id: string) => unknown) => {
+    apply(ctx: any): void;
+    inject: string[];
     __testing: {
+      createSettingsApi(remote: any): any;
       splitIds(value: string): string[];
       telegramValue(section: unknown): Record<string, unknown>;
       messengerNamespace(describe: unknown): unknown;
@@ -31,7 +34,7 @@ interface ClientDefinition {
   };
 }
 
-function loadClientTesting() {
+function loadClient() {
   let definition: ClientDefinition | undefined;
   const execute = new Function('window', CLIENT_SOURCE);
   execute({
@@ -53,11 +56,81 @@ function loadClientTesting() {
   return definition.factory((id) => {
     if (id === 'react') return reactStub;
     throw new Error(`unexpected client import: ${id}`);
-  }).__testing;
+  });
+}
+
+function loadClientTesting() {
+  return loadClient().__testing;
 }
 
 describe('Messenger Web settings helpers', () => {
   const testing = loadClientTesting();
+
+  it('uses controller remotes without the removed connection.api property', async () => {
+    const client = loadClient();
+    const describe = vi.fn(async () => ({ ok: true, value: { namespaces: [] } }));
+    let injected: any;
+    const bind = vi.fn(() => ({}));
+    client.apply({
+      remote: { settings: { describe }, credentials: {} },
+      // No connection service or get() method: modern transport has no .api.
+      settingsScope: { bind, describe: () => ({}) },
+      effect: () => {},
+      slots: {
+        inject: (_slot: string, register: () => void) => register(),
+        register: (section: any) => { injected = section.inject(); },
+      },
+    });
+    expect(client.inject).toContain('remote.settings');
+    expect(client.inject).toContain('remote.credentials');
+    expect(client.inject).not.toContain('connection');
+    expect(bind).toHaveBeenCalledWith({ namespace: 'messenger' });
+    await expect(injected.api.settings.describe({})).resolves.toEqual({
+      result: { ok: true, value: { namespaces: [] } },
+    });
+    expect(describe).toHaveBeenCalledWith();
+  });
+
+  it('adapts positional remote calls and Telegram credential metadata', async () => {
+    const metadata = { TELEGRAM_BOT_TOKEN: { configured: true, writable: true } };
+    const remote = {
+      settings: {
+        describe: vi.fn(async () => ({ ok: true, value: { namespaces: [] } })),
+        mutate: vi.fn(async () => ({ ok: true, value: { revision: 7 } })),
+      },
+      credentials: {
+        describe: vi.fn(async () => ({ ok: true, value: metadata })),
+        set: vi.fn(async () => ({ ok: true, value: undefined })),
+        unset: vi.fn(async () => ({ ok: true, value: undefined })),
+      },
+    };
+    const api = testing.createSettingsApi(remote);
+    const ops = [{ op: 'set', path: ['telegram'], value: { enabled: false } }];
+    await expect(api.settings.mutate({ ns: 'messenger', ops, expectedRevision: 6 })).resolves.toEqual({
+      result: { ok: true, value: { revision: 7 } },
+    });
+    expect(remote.settings.mutate).toHaveBeenCalledWith('messenger', ops, 6);
+    const refs = Object.keys(metadata);
+    expect(await api.credentials.describe({ refs })).toEqual({
+      result: { ok: true, value: { credentials: metadata } },
+    });
+    expect(remote.credentials.describe).toHaveBeenCalledWith(refs);
+    await expect(api.credentials.set({ ref: refs[0], value: 'test-value' })).resolves.toEqual({
+      result: { ok: true, value: undefined },
+    });
+    expect(remote.credentials.set).toHaveBeenCalledWith(refs[0], 'test-value');
+    await expect(api.credentials.unset({ ref: refs[0] })).resolves.toEqual({
+      result: { ok: true, value: undefined },
+    });
+    expect(remote.credentials.unset).toHaveBeenCalledWith(refs[0]);
+    const denied = { ok: false, error: { message: 'Not authorized' } };
+    remote.credentials.describe.mockResolvedValueOnce(denied as any);
+    expect(await api.credentials.describe({ refs })).toEqual({ result: denied });
+    remote.settings.describe.mockResolvedValueOnce(denied as any);
+    const scope = testing.createDirectSettingsScope(api);
+    await expect(scope.reload()).rejects.toThrow('Not authorized');
+    await scope.dispose();
+  });
 
   it('normalizes and deduplicates ID lists', () => {
     expect(testing.splitIds('123, 456\n123')).toEqual(['123', '456']);

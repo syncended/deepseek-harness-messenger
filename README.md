@@ -24,6 +24,7 @@ A bridge plugin between [DeepSeek Harness](https://github.com/deepseek-ai/deepse
 - safe Telegram Markdown rendering for headings, emphasis, code, links, quotes, and lists;
 - formatting-preserving splitting at Telegram's 4096-character limit;
 - low-latency batch polling without per-chat head-of-line blocking;
+- durable opt-in automation notifications with an explicit Open session button;
 - a shared `MessengerAdapter` interface for future transports.
 
 ## Telegram controls
@@ -43,7 +44,8 @@ Send `/start` or `/menu` to open the dashboard. Its buttons provide session, mod
 | `/context` | Show context pressure, composition, and cumulative usage |
 | `/steer <text>` | Send steering to the active turn |
 | `/cancel` | Request cancellation of the active turn |
-| `/unbind` | Remove the current binding |
+| `/unbind` | Remove the current binding (keep notifications) |
+| `/notifications [on\|off]` | Show or change durable Host-wide notification subscription |
 | `/help` | Show command help |
 
 `/use <session-id>` remains as an alias for `/resume <session-id>`. Any other text is queued as a follow-up to the bound session.
@@ -54,17 +56,19 @@ When DSH calls `ask_user_question`, the bot pauses typing and shows the question
 
 ## Agent notifications
 
-The `messenger_notify` tool sends a standalone message to every messenger chat currently bound to the calling agent's session:
+Enable `/notifications on` in an allowed Telegram chat to receive Host-wide status notifications. The `messenger_notify` tool sends a standalone message to all authorized subscribed chats, including from automation sessions without any chat-session binding:
 
 ```json
 { "text": "The build is ready. You can review the result." }
 ```
 
-Bind the session first with `/resume` or `/new` in Telegram. Notifications also work when that session is driven from DSH Web rather than Telegram. The tool accepts only text (non-blank, at most 16,000 characters); session and recipient IDs cannot be supplied by the model. Subagents do not inherit their parent's bindings. In a bound group, **every group member can see notifications**.
+No `/resume` or `/new` is needed. Each notification includes an **Открыть сессию** (Open session) button for the source session. Delivery never switches the selected session; only the subscriber's explicit click opens it through the normal resume path. The tool accepts only text (non-blank, at most 16,000 characters); session and recipient IDs cannot be supplied by the model. Subagents are rejected based on their durable session origin. In a subscribed group, **every group member can see notifications from any top-level session or automation on this Host**.
+
+Subscriptions persist in the DSH storage domain `messenger_notifications` across restarts, live reconfiguration, and `/unbind`. `/notifications` shows the current status; `/notifications off` unsubscribes and invalidates old buttons. Buttons are opaque, scoped to the subscribing operator/chat/transport, expire after 30 days, and may be evicted when the 4,096-link limit is reached. Current allowlists are checked before delivery and button use. A removed or unavailable source session cannot be opened.
 
 Use it for explicitly requested notifications or useful milestones, not to duplicate the normal final response or send secrets. Markdown rendering and Telegram message splitting are handled by the adapter. This is an immediate send, not a scheduler, and does not wait for a reply; use `ask_user_question` for questions.
 
-The result reports counts of `sent`, `failed`, and `skipped` chats. A failed multi-part send may already have delivered some text; do not blindly retry partial failures. `sent` means the transport accepted the message, not that the user read it. Queued notifications are skipped if the binding changes, the call is cancelled, or the bridge stops before sending; already-started sends cannot be recalled and multi-part sends may finish after cancellation or unbinding. With no active adapter or binding, the tool returns an error. Bindings reset on plugin restart or successful live reconfiguration; use `/resume` again.
+The result reports counts of `sent`, `failed`, and `skipped` chats. A failed multi-part send may already have delivered some text; do not blindly retry partial failures. `sent` means the transport accepted the message, not that the user read it. Queued notifications are skipped if the subscription is removed or replaced, the call is cancelled, or the bridge stops before sending. Already-started sends cannot be recalled and multi-part sends may finish after cancellation or unsubscribe. With no active adapter or authorized subscribers, the tool returns an error. Session bindings still reset on restart or successful reconfiguration; notification subscriptions do not.
 
 ## Progressive responses
 
@@ -75,7 +79,7 @@ Raw tool arguments, raw results, file contents, shell output, credentials, and o
 ## Requirements
 
 - Node.js 22 or newer.
-- DeepSeek Harness `0.1.2-rc.1` or a compatible Web profile.
+- DeepSeek Harness `0.1.2-rc.1` or a compatible Web profile with the `storageDomain` service (provided by DSH base).
 - A Telegram bot token from [BotFather](https://t.me/BotFather).
 - Outbound DNS and HTTPS access to `api.telegram.org` from the Harness host.
 - pnpm 10 through Corepack only for source development.
@@ -167,7 +171,7 @@ Every authorized Telegram operator is trusted as a Host-wide DSH operator. They 
 
 In a group, mirrored output is visible to every group member even though only IDs in `allowedUserIds` can issue commands. Use groups only when every participant may see the connected session.
 
-Inline callback payloads contain only opaque random one-use IDs. Ordinary control actions are held in process memory for ten minutes; question options can remain valid for up to 24 hours. Every action is bound to the originating transport, chat, operator, target session, and binding revision. Session IDs, paths, permission payloads, tool arguments, and credentials are not placed in Telegram callback data.
+Inline callback payloads contain only opaque random IDs. Ordinary control actions use one-use IDs held in process memory for ten minutes; question options can remain valid for up to 24 hours. These controls are scoped to the originating transport, chat, operator, target session, and binding revision. Notification buttons instead persist for up to 30 days and are scoped to the subscription, chat, transport, operator, and source session; they remain usable until expiry, eviction, or subscription revocation. Session IDs, paths, permission payloads, tool arguments, and credentials are not placed in Telegram callback data.
 
 The credential reference is fixed to `TELEGRAM_BOT_TOKEN` so the plugin cannot resolve, overwrite, or remove credentials owned by another integration. Token values are checked for Telegram bot-token syntax before requests are sent.
 
@@ -209,7 +213,7 @@ DiscordAdapter ──┘          ^                        |
 - DSH's permission-preset service performs permission changes; the plugin does not bypass sandbox or approval policy APIs.
 - Durable `session/event` records drive streamed text, tool status, and final output.
 
-Bindings and callback actions are currently process-local and reset when the plugin restarts.
+Bindings and ordinary control callbacks are process-local and reset when the plugin restarts. `NotificationStore` persists subscriptions and source-session notification links through the Host's `storageDomain` service in `messenger_notifications`.
 
 ## Roadmap
 

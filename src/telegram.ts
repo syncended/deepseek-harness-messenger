@@ -27,6 +27,7 @@ const BOT_COMMANDS = [
   { command: 'steer', description: 'Send steering instructions' },
   { command: 'cancel', description: 'Cancel the current operation' },
   { command: 'unbind', description: 'Unbind the current session' },
+  { command: 'notifications', description: 'Notifications on/off, independent of selected session' },
   { command: 'help', description: 'Show command help' },
 ] as const;
 

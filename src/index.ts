@@ -8,6 +8,7 @@ import z from '@deepseek-ai/schemastery';
 import { MessengerBridge } from './bridge.js';
 import { TelegramAdapter } from './telegram.js';
 import { installNotificationTool } from './notifications.js';
+import { openNotificationStore, type NotificationStore } from './notification-store.js';
 
 export { MessengerBridge, parseCommand } from './bridge.js';
 export { TelegramAdapter, TelegramApiError, splitTelegramText } from './telegram.js';
@@ -26,6 +27,7 @@ export const inject = [
   'permissionPresets',
   'settings',
   'tools',
+  'storageDomain',
 ];
 export const MESSENGER_SETTINGS_NAMESPACE = 'messenger';
 
@@ -89,6 +91,7 @@ async function startTelegramRuntime(
   config: TelegramConfig,
   controller: AbortController,
   beforeActivate: () => Promise<void>,
+  notificationStore: NotificationStore,
 ): Promise<TelegramRuntime> {
   if (config.allowedChatIds.length === 0) {
     ctx.logger.warn(
@@ -112,8 +115,9 @@ async function startTelegramRuntime(
     disposeSessionEvents?.();
     disposeQuestionAnswerer?.();
     controller.abort(new Error('messenger Telegram runtime stopped'));
+    const disposingBridge = bridge?.dispose();
     await Promise.allSettled([polling, ...outbound]);
-    await bridge?.dispose();
+    await disposingBridge;
   };
 
   const tokenRef = credentialRef(TELEGRAM_BOT_TOKEN_REF);
@@ -159,6 +163,7 @@ async function startTelegramRuntime(
     allowedChatIds: config.allowedChatIds,
     allowedUserIds: config.allowedUserIds,
     privateChatsOnly: config.privateChatsOnly,
+    notificationStore,
   });
   bridge.registerAdapter(adapter);
   disposeQuestionAnswerer = installQuestionAnswerer(ctx, bridge);
@@ -242,7 +247,11 @@ export async function apply(ctx: Context, entryConfig: Config): Promise<void> {
   let generation = 0;
   let tail: Promise<void> = Promise.resolve();
 
-  installNotificationTool(ctx, () => disposed ? undefined : active?.bridge);
+  const notificationStore = await openNotificationStore(ctx);
+  installNotificationTool(ctx, () => {
+    const bridge = disposed ? undefined : active?.bridge;
+    return bridge === undefined ? [] : [bridge];
+  });
 
   const reconcile = (): Promise<void> => {
     const requestedGeneration = ++generation;
@@ -281,6 +290,7 @@ export async function apply(ctx: Context, entryConfig: Config): Promise<void> {
             await previous?.stop();
             if (active === previous) active = undefined;
           },
+          notificationStore,
         );
         if (disposed || requestedGeneration !== generation) {
           await next.stop();

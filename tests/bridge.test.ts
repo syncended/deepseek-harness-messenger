@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { MessengerBridge, parseCommand, type BridgeContext } from '../src/bridge.js';
 import { splitTelegramText } from '../src/telegram.js';
+import { NotificationStore, NOTIFICATION_LINK_TTL_MS } from '../src/notification-store.js';
 import type {
   InboundCallbackInteraction,
   InboundTextMessage,
@@ -291,6 +292,200 @@ describe('MessengerBridge notifications', () => {
     const second = bridge.notify('session-1', 'Second');
     await bridge.handle(message('/unbind'));
     await bridge.handle(message('/resume session-1'));
+    release();
+    await first;
+    expect(await second).toEqual({ sent: 0, failed: 0, skipped: 1 });
+    expect(adapter.sent.some((item) => item.text === 'Second')).toBe(false);
+    await bridge.dispose();
+  });
+});
+
+describe('persistent notification subscriptions', () => {
+  function setup() {
+    const transport = 'telegram';
+    const context = fakeContext();
+    let persisted: unknown = { subscriptions: [], links: [] };
+    let now = Date.now();
+    const save = vi.fn(async (value: unknown) => { persisted = structuredClone(value); });
+    const makeStore = () => new NotificationStore(persisted, save, () => now);
+    const store = makeStore();
+    const makeBridge = (notificationStore = store, chats = ['100']) => {
+      const adapter = new FakeAdapter();
+      const bridge = new MessengerBridge(context.ctx, {
+        notificationStore, allowedChatIds: chats, allowedUserIds: ['100'], privateChatsOnly: false,
+      });
+      bridge.registerAdapter(adapter);
+      return { bridge, adapter };
+    };
+    const inbound = (text: string, chatId = '100') => ({ ...message(text, chatId), transport });
+    const click = (data: string, senderId = '100') => ({ ...callback(data, senderId), transport });
+    return { ...context, ...makeBridge(), store, makeStore, makeBridge, inbound, click, save,
+      expire: () => { now += NOTIFICATION_LINK_TTL_MS + 1; } };
+  }
+
+  it('notifies an unbound Telegram subscriber and opens source only on click', async () => {
+    const { bridge, adapter, inbound, click, prompt } = setup();
+    await bridge.handle(inbound('/notifications on'));
+    expect(bridge.canNotify('session-1')).toBe(true);
+    expect(await bridge.notify('session-1', 'Automation complete')).toEqual({ sent: 1, failed: 0, skipped: 0 });
+    const data = firstCallback(adapter);
+    expect(data).toMatch(/^n:[A-Za-z0-9_-]{32}$/);
+    expect(Buffer.byteLength(data)).toBeLessThanOrEqual(64);
+    expect(data).not.toContain('session-1');
+    expect(adapter.sent.at(-1)?.options?.keyboard?.[0]?.[0]?.text).toBe('Открыть сессию');
+    await bridge.handle(inbound('Before click'));
+    expect(prompt).not.toHaveBeenCalled();
+    await bridge.handle(click(data));
+    await bridge.handle(inbound('After click'));
+    expect(prompt).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'session-1' }), expect.anything());
+    await bridge.dispose();
+  });
+
+  it('keeps the currently selected session until the notification button is clicked', async () => {
+    const { bridge, adapter, inbound, click, prompt, sessions } = setup();
+    const original = (await sessions.list()).items[0]!;
+    sessions.list.mockResolvedValue({ items: [original, { ...original, sessionId: 'automation-run' }] });
+    await bridge.handle(inbound('/resume session-1'));
+    await bridge.handle(inbound('/notifications on'));
+    await bridge.notify('automation-run', 'New run status');
+    const data = firstCallback(adapter);
+    await bridge.handle(inbound('Current conversation'));
+    expect(prompt).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId: 'session-1' }), expect.anything());
+    await bridge.handle(click(data));
+    await bridge.handle(inbound('Automation follow-up'));
+    expect(prompt).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId: 'automation-run' }), expect.anything());
+    await bridge.dispose();
+  });
+
+  it('preserves subscriptions and buttons across bridge and store restarts, and /unbind', async () => {
+    const f = setup();
+    await f.bridge.handle(f.inbound('/notifications on'));
+    await f.bridge.notify('session-1', 'First');
+    const data = firstCallback(f.adapter);
+    await f.bridge.dispose();
+    const restarted = f.makeBridge(f.makeStore());
+    await restarted.bridge.notify('session-1', 'After restart');
+    await restarted.bridge.handle(f.click(data));
+    await restarted.bridge.handle(f.inbound('/unbind'));
+    expect(await restarted.bridge.notify('session-1', 'Still subscribed')).toEqual({ sent: 1, failed: 0, skipped: 0 });
+    await restarted.bridge.dispose();
+  });
+
+  it('does not subscribe automatically on /resume and fails closed if saving subscription fails', async () => {
+    const { bridge, store, inbound, save } = setup();
+    await bridge.handle(inbound('/resume session-1'));
+    await expect(bridge.notify('session-1', 'No subscription')).rejects.toThrow('/notifications on');
+    save.mockRejectedValueOnce(new Error('Disk full'));
+    await bridge.handle(inbound('/notifications on'));
+    expect(store.get('telegram', '100')).toBeUndefined();
+    expect(bridge.canNotify('session-1')).toBe(false);
+    await bridge.dispose();
+  });
+
+  it('does not deliver a notification if its durable button cannot be saved', async () => {
+    const { bridge, adapter, inbound, save } = setup();
+    await bridge.handle(inbound('/notifications on'));
+    adapter.sent.length = 0;
+    save.mockRejectedValueOnce(new Error('Storage unavailable'));
+    expect(await bridge.notify('session-1', 'Must not be sent')).toEqual({ sent: 0, failed: 1, skipped: 0 });
+    expect(adapter.sent).toEqual([]);
+    await bridge.dispose();
+  });
+
+  it('does not switch sessions when the subscription is revoked during source resolution', async () => {
+    const { bridge, adapter, inbound, click, store, sessions, agent, prompt } = setup();
+    await bridge.handle(inbound('/notifications on'));
+    await bridge.notify('session-1', 'Done');
+    const data = firstCallback(adapter);
+    sessions.resolveAgent.mockImplementationOnce(async () => {
+      await store.unsubscribe('telegram', '100');
+      return { agent };
+    });
+    await bridge.handle(click(data));
+    await bridge.handle(inbound('No active session'));
+    expect(prompt).not.toHaveBeenCalled();
+    await bridge.dispose();
+  });
+
+  it('blocks unauthorized subscription commands and foreign notification button clicks', async () => {
+    const { bridge, adapter, store, inbound, click, sessions } = setup();
+    await bridge.handle(inbound('/notifications on', '999'));
+    expect(store.get('telegram', '999')).toBeUndefined();
+    await bridge.handle(inbound('/notifications on'));
+    await bridge.notify('session-1', 'Done');
+    const data = firstCallback(adapter);
+    sessions.resolveAgent.mockClear();
+    await bridge.handle(click(data, 'other-user'));
+    expect(adapter.answers.at(-1)?.alert).toBe(true);
+    expect(sessions.resolveAgent).not.toHaveBeenCalled();
+    await bridge.handle({ ...click(data), chatId: '999' });
+    expect(sessions.resolveAgent).not.toHaveBeenCalled();
+    await bridge.dispose();
+  });
+
+  it('invalidates buttons on unsubscribe even after re-subscribing', async () => {
+    const { bridge, adapter, inbound, click, sessions } = setup();
+    await bridge.handle(inbound('/notifications on'));
+    await bridge.notify('session-1', 'Done');
+    const data = firstCallback(adapter);
+    await bridge.handle(inbound('/notifications off'));
+    expect(bridge.canNotify('session-1')).toBe(false);
+    await bridge.handle(inbound('/notifications on'));
+    await bridge.handle(click(data));
+    expect(adapter.answers.at(-1)?.alert).toBe(true);
+    expect(sessions.resolveAgent).not.toHaveBeenCalled();
+    await bridge.dispose();
+  });
+
+  it('rechecks allowlists on restart without leaking notifications to revoked chats', async () => {
+    const f = setup();
+    await f.bridge.handle(f.inbound('/notifications on'));
+    await f.bridge.dispose();
+    const restarted = f.makeBridge(f.makeStore(), ['200']);
+    expect(restarted.bridge.canNotify('session-1')).toBe(false);
+    await expect(restarted.bridge.notify('session-1', 'Private')).rejects.toThrow('No notification subscribers');
+    expect(restarted.adapter.sent).toHaveLength(0);
+    await restarted.bridge.dispose();
+  });
+
+  it('reports expired and deleted source sessions without switching an existing binding', async () => {
+    const { bridge, adapter, inbound, click, expire, sessions, prompt } = setup();
+    await bridge.handle(inbound('/resume session-1'));
+    await bridge.handle(inbound('/notifications on'));
+    await bridge.notify('missing-session', 'Deleted run');
+    const data = firstCallback(adapter);
+    await bridge.handle(click(data));
+    expect(adapter.sent.at(-1)?.text).toContain('Could not open');
+    await bridge.handle(inbound('Still original'));
+    expect(prompt).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId: 'session-1' }), expect.anything());
+    expire();
+    sessions.resolveAgent.mockClear();
+    await bridge.handle(click(data));
+    expect(adapter.answers.at(-1)?.alert).toBe(true);
+    expect(sessions.resolveAgent).not.toHaveBeenCalled();
+    await bridge.dispose();
+  });
+
+  it('skips queued notifications after unsubscribe and persists a link before transport delivery', async () => {
+    const { bridge, adapter, inbound, store } = setup();
+    await bridge.handle(inbound('/notifications on'));
+    let release!: () => void;
+    let started!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const entered = new Promise<void>((resolve) => { started = resolve; });
+    const send = adapter.sendText.bind(adapter);
+    vi.spyOn(adapter, 'sendText').mockImplementation(async (chatId, text, options) => {
+      if (text === 'First') {
+        const token = options?.keyboard?.[0]?.[0]?.callbackData?.slice(2);
+        expect(token && store.link(token)).toBeTruthy();
+        started(); await blocked;
+      }
+      return send(chatId, text, options);
+    });
+    const first = bridge.notify('session-1', 'First');
+    await entered;
+    const second = bridge.notify('session-1', 'Second');
+    await bridge.handle(inbound('/notifications off'));
     release();
     await first;
     expect(await second).toEqual({ sent: 0, failed: 0, skipped: 1 });

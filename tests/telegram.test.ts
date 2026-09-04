@@ -156,6 +156,7 @@ describe('TelegramAdapter credentials', () => {
       'steer',
       'cancel',
       'unbind',
+      'notifications',
       'help',
     ]);
     expect(body.commands.every(({ description }) => description.length > 0)).toBe(true);
