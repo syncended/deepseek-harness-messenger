@@ -1,6 +1,6 @@
 {
   "name": "@syncended/dsh-messenger",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "Messenger bridge plugin for DeepSeek Harness, starting with Telegram",
   "type": "module",
   "main": "dist/index.js",
@@ -17,6 +17,7 @@
   "files": [
     "dist",
     "lib/client.js",
+    "python/worker.py",
     "cordis.patch.yml",
     "docs/assets/telegram-settings.png",
     "README.md",

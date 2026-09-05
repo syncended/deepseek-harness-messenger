@@ -1,5 +1,6 @@
 import type {
   InboundMessengerMessage,
+  InboundVoiceMessage,
   MessengerAdapter,
   MessengerInlineKeyboard,
   MessengerMessageHandle,
@@ -7,6 +8,8 @@ import type {
 } from './types.js';
 
 const TELEGRAM_TEXT_LIMIT = 4_096;
+const TELEGRAM_VOICE_BYTE_LIMIT = 20 * 1024 * 1024;
+const MAX_VOICE_DOWNLOAD_TIMEOUT_MS = 60_000;
 const DEFAULT_RETRY_DELAY_MS = 1_000;
 const MAX_RETRY_DELAY_MS = 30_000;
 const POLL_BATCH_LIMIT = 32;
@@ -26,6 +29,7 @@ const BOT_COMMANDS = [
   { command: 'context', description: 'Show context usage' },
   { command: 'steer', description: 'Send steering instructions' },
   { command: 'cancel', description: 'Cancel the current operation' },
+  { command: 'voice_cancel', description: 'Cancel pending voice transcription' },
   { command: 'unbind', description: 'Unbind the current session' },
   { command: 'notifications', description: 'Notifications on/off, independent of selected session' },
   { command: 'help', description: 'Show command help' },
@@ -33,6 +37,7 @@ const BOT_COMMANDS = [
 
 interface TelegramUser {
   readonly id: number;
+  readonly is_bot?: boolean;
   readonly first_name?: string;
   readonly last_name?: string;
   readonly username?: string;
@@ -48,6 +53,13 @@ interface TelegramMessage {
   readonly text?: string;
   readonly chat: TelegramChat;
   readonly from?: TelegramUser;
+  readonly sender_chat?: unknown;
+  readonly voice?: {
+    readonly file_id: string;
+    readonly duration: number;
+    readonly file_size?: number;
+    readonly mime_type?: string;
+  };
 }
 
 interface TelegramCallbackQuery {
@@ -362,11 +374,8 @@ function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> 
     const rejectForAbort = (): void => {
       reject(signal.reason ?? new Error('Telegram operation aborted'));
     };
-    if (signal.aborted) {
-      rejectForAbort();
-      return;
-    }
-    signal.addEventListener('abort', rejectForAbort, { once: true });
+    if (signal.aborted) rejectForAbort();
+    else signal.addEventListener('abort', rejectForAbort, { once: true });
     void promise.then(
       (value) => {
         signal.removeEventListener('abort', rejectForAbort);
@@ -428,6 +437,18 @@ function normalizeGroupCommand(
   );
 }
 
+function validVoiceSize(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/** Never reflect Telegram URLs, credentials, or raw transport errors. */
+function safeApiDescription(value: unknown, token: string, status: number): string {
+  if (typeof value !== 'string') return `HTTP ${status}`;
+  const withoutUrls = value.replace(/https?:\/\/[^\s<>"']+/gi, '[redacted URL]');
+  return (token ? withoutUrls.split(token).join('[redacted]') : withoutUrls)
+    .replace(/\b\d{5,}:[A-Za-z0-9_-]+\b/g, '[redacted]');
+}
+
 function inboundUpdate(
   update: TelegramUpdate,
   botUsername: string | undefined,
@@ -448,6 +469,38 @@ function inboundUpdate(
         message.chat.type,
         botUsername,
       ),
+    };
+  }
+
+  if (message?.voice !== undefined) {
+    const voice = message.voice;
+    const user = message.from;
+    if (
+      voice === null
+      || user == null
+      || !Number.isSafeInteger(user.id) || user.id <= 0
+      || user.is_bot === true || message.sender_chat !== undefined
+      || typeof voice.file_id !== 'string' || voice.file_id.trim() === ''
+      || typeof voice.duration !== 'number'
+      || !Number.isFinite(voice.duration) || voice.duration < 0
+      || (voice.file_size !== undefined && !validVoiceSize(voice.file_size))
+    ) return undefined;
+    const name = senderName(user);
+    return {
+      kind: 'voice',
+      transport: 'telegram',
+      messageId: String(message.message_id),
+      chatId: String(message.chat.id),
+      chatKind: message.chat.type,
+      senderId: String(user.id),
+      ...(name === undefined ? {} : { senderName: name }),
+      text: '',
+      voice: {
+        fileId: voice.file_id,
+        durationSeconds: voice.duration,
+        ...(voice.file_size === undefined ? {} : { sizeBytes: voice.file_size }),
+        ...(typeof voice.mime_type === 'string' ? { mimeType: voice.mime_type } : {}),
+      },
     };
   }
 
@@ -717,6 +770,98 @@ export class TelegramAdapter implements MessengerAdapter {
     });
   }
 
+  async downloadVoice(message: InboundVoiceMessage, signal: AbortSignal): Promise<Uint8Array> {
+    const operation = 'downloadVoice';
+    const configuredTimeout = this.options.requestTimeoutMs;
+    const timeout = Number.isFinite(configuredTimeout) && configuredTimeout > 0
+      ? Math.min(Math.floor(configuredTimeout), MAX_VOICE_DOWNLOAD_TIMEOUT_MS)
+      : MAX_VOICE_DOWNLOAD_TIMEOUT_MS;
+    const controller = new AbortController();
+    const requestSignal = AbortSignal.any([
+      signal,
+      ...(this.options.signal === undefined ? [] : [this.options.signal]),
+      AbortSignal.timeout(timeout),
+      controller.signal,
+    ]);
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let downloadToken = typeof this.options.token === 'string' ? this.options.token : '';
+    const checkSize = (size: unknown): void => {
+      if (size === undefined) return;
+      if (!validVoiceSize(size)) throw new TelegramApiError(operation, 'invalid voice size');
+      if (size > TELEGRAM_VOICE_BYTE_LIMIT) {
+        throw new TelegramApiError(operation, 'voice exceeds 20 MB limit');
+      }
+    };
+    try {
+      requestSignal.throwIfAborted();
+      checkSize(message.voice.sizeBytes);
+      const file = await raceWithAbort(this.call<{
+        file_path?: unknown;
+        file_size?: unknown;
+      }>('getFile', { file_id: message.voice.fileId }, requestSignal), requestSignal);
+      checkSize(file.file_size);
+      const path = file.file_path;
+      // Accept only relative Telegram file paths, never URLs, encoded separators,
+      // dot segments, queries, fragments, backslashes, or redirect destinations.
+      if (
+        typeof path !== 'string' || path.length > 1024
+        || !/^[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:\/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*$/.test(path)
+      ) throw new TelegramApiError(operation, 'invalid Telegram file path');
+      const token = await this.resolveToken(operation, requestSignal);
+      downloadToken = token;
+      requestSignal.throwIfAborted();
+      const response = await raceWithAbort(this.fetchImpl(
+        `https://api.telegram.org/file/bot${token}/${path}`,
+        { signal: requestSignal, redirect: 'error' },
+      ), requestSignal);
+      if (!response.ok) throw new TelegramApiError(operation, `HTTP ${response.status}`);
+      const contentLength = response.headers.get('content-length');
+      if (contentLength !== null) checkSize(Number(contentLength));
+      if (response.body === null) throw new TelegramApiError(operation, 'missing voice body');
+      reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let length = 0;
+      while (true) {
+        requestSignal.throwIfAborted();
+        const chunk = await raceWithAbort(reader.read(), requestSignal);
+        if (chunk.done) break;
+        length += chunk.value.byteLength;
+        checkSize(length);
+        chunks.push(chunk.value);
+      }
+      const bytes = new Uint8Array(length);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return bytes;
+    } catch (error) {
+      if (requestSignal.aborted) throw new TelegramApiError(operation, 'request aborted or timed out');
+      if (error instanceof TelegramApiError) {
+        throw new TelegramApiError(operation, safeApiDescription(error.description, downloadToken, 0));
+      }
+      throw new TelegramApiError(operation, 'voice request failed');
+    } finally {
+      controller.abort();
+      // Do not let an uncooperative stream delay cancellation or leak its error.
+      if (reader !== undefined) void reader.cancel().catch(() => {});
+    }
+  }
+
+  private async resolveToken(operation: string, signal: AbortSignal): Promise<string> {
+    try {
+      signal.throwIfAborted();
+      return typeof this.options.token === 'string'
+        ? this.options.token
+        : await raceWithAbort(this.options.token(), signal);
+    } catch {
+      throw new TelegramApiError(operation, signal.aborted
+        ? 'request aborted or timed out'
+        : 'credential resolution failed');
+    }
+  }
+
   private async loadBotUsername(signal?: AbortSignal): Promise<void> {
     const bot = await this.call<TelegramUser>('getMe', {}, signal);
     this.botUsername = bot.username?.replace(/^@/, '');
@@ -744,10 +889,7 @@ export class TelegramAdapter implements MessengerAdapter {
       AbortSignal.timeout(timeoutMs),
     ].filter((candidate): candidate is AbortSignal => candidate !== undefined);
     const requestSignal = AbortSignal.any(signals);
-    if (requestSignal.aborted) throw requestSignal.reason;
-    const token = typeof this.options.token === 'string'
-      ? this.options.token
-      : await raceWithAbort(this.options.token(), requestSignal);
+    const token = await this.resolveToken(operation, requestSignal);
 
     let response: Response;
     try {
@@ -758,11 +900,13 @@ export class TelegramAdapter implements MessengerAdapter {
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify(body),
           signal: requestSignal,
+          redirect: 'error',
         },
       );
-    } catch (error) {
-      if (requestSignal.aborted) throw error;
-      throw new TelegramApiError(operation, 'network request failed');
+    } catch {
+      throw new TelegramApiError(operation, requestSignal.aborted
+        ? 'request aborted or timed out'
+        : 'network request failed');
     }
 
     let payload: TelegramResponse<T> | undefined;
@@ -774,14 +918,16 @@ export class TelegramAdapter implements MessengerAdapter {
     if (!response.ok || payload === undefined || !payload.ok) {
       throw new TelegramApiError(
         operation,
-        payload?.description ?? `HTTP ${response.status}`,
+        safeApiDescription(payload?.description, token, response.status),
         {
-          ...(payload?.error_code === undefined
-            ? {}
-            : { errorCode: payload.error_code }),
-          ...(payload?.parameters?.retry_after === undefined
-            ? {}
-            : { retryAfter: payload.parameters.retry_after }),
+          ...(typeof payload?.error_code === 'number' && Number.isSafeInteger(payload.error_code)
+            ? { errorCode: payload.error_code }
+            : {}),
+          ...(typeof payload?.parameters?.retry_after === 'number'
+            && Number.isFinite(payload.parameters.retry_after)
+            && payload.parameters.retry_after >= 0
+            ? { retryAfter: payload.parameters.retry_after }
+            : {}),
         },
       );
     }

@@ -19,6 +19,7 @@ A bridge plugin between [DeepSeek Harness](https://github.com/deepseek-ai/deepse
 - compact dashboards using DSH workspace display names without opaque session hashes;
 - provider-grouped, paginated model selection and compact reasoning controls;
 - interactive `ask_user_question` choices, multi-select, and free-text answers;
+- on-demand local Whisper transcription of Telegram voice messages, with lazy runtime/model installation and full idle unload;
 - context pressure, composition, and cumulative token-usage visibility;
 - follow-up, steering, and turn cancellation controls;
 - Claude-style animated progress, typing activity, streamed message edits, and contextual tool status;
@@ -201,6 +202,65 @@ pnpm check
 npm pack --dry-run
 ```
 
+Normal tests do not install Whisper or download a model. Optional voice checks:
+
+```bash
+# Python stdlib-only worker/cache invariants; uses an explicitly selected test interpreter.
+DSH_VOICE_TEST_PYTHON=python3 pnpm exec vitest run tests/voice.test.ts
+# Real CPU transcription: downloads runtime, wheels, tiny model and public test speech
+# into disposable temporary directories, verifies FLAC + OGG, then cleans up.
+DSH_VOICE_REAL_SMOKE=1 pnpm exec vitest run tests/voice.test.ts -t 'REAL isolated'
+```
+
+## Local voice messages
+
+Select a session with `/resume` or `/new`, then send a Telegram **voice message**. Local Whisper is enabled by default but does **nothing until an authorized operator sends a valid recording to a selected session**. Disable it or select a model/device under **Settings → Messengers → Local Whisper**, saved independently of the Telegram token/settings.
+
+The first recording shows preparation status, downloads an isolated managed Python runtime and pinned Whisper wheels, and downloads the selected model. Recognition uses [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper); it does not require system Python, `pip`, FFmpeg, Docker, a separately started server, or `sudo`. No heavy download or Python process runs during `npm install`, plugin initialization, or ordinary text chat.
+
+After recognition, the bot displays the transcript and automatically queues it as ordinary user content in the originally selected session. If the recording was received while a question awaited your answer, it answers that specific question instead. There is no LLM rewriting step and recognized slash commands are **never interpreted as messenger controls**. Answers remain text; arbitrary audio documents, video, TTS and transcript-confirmation mode are not included.
+
+### Limits, ordering and cancellation
+
+- Maximum recording: **5 minutes / 20 MiB**. Downloaded bytes and actual decoded duration are checked independently of Telegram metadata. VAD filters silence, but recognition can still make mistakes, especially with paths and technical names.
+- One FIFO transcription queue per plugin module/Host, at most eight accepted jobs globally and three per operator. Only the active recording is downloaded. A worker/model is reused for already queued recordings, then the entire process exits when the queue drains, releasing RAM and VRAM.
+- Voice submissions preserve their order. Text and control commands remain responsive during preparation and can overtake pending voice messages.
+- Use the **Cancel transcription** button for one recording, or `/voice_cancel` for all your pending recordings. `/cancel` retains its existing meaning: cancel the DSH turn, not transcription. Cancelling a transcript does not retract a request already handed to DSH.
+- Changing/unbinding a session, or resolving/advancing the target question, prevents stale text from being sent to a different destination. The transcript remains visible for manual resending. Reconfiguring/disabling the messenger or stopping the Host cancels in-flight transcription; it is not replayed automatically.
+- Installation/inference have bounded timeouts. A failed or empty transcription never starts an agent turn. First installation may take minutes; retrying reuses completed artifacts.
+
+### Devices and supported hosts
+
+Default configuration (existing configurations without `voice` use these values):
+
+```yaml
+voice:
+  enabled: true
+  model: small
+  device: auto
+```
+
+This is a sibling of `telegram` in the messenger settings. Models: `tiny`, `base`, `small`, `medium`, `large-v3`, `turbo`. Devices: `auto`, `cpu`, `cuda`. The selected model is never silently changed. Start with `small` on CPU; use `tiny`/`base` on constrained VMs or a larger model on a capable GPU.
+
+Supported runtime targets are Linux x64/arm64 with glibc 2.28+ and macOS 14+ on Intel/Apple Silicon. Windows users can run the Host in WSL2; Alpine/musl and 32-bit hosts are unsupported. `auto` uses compatible NVIDIA CUDA when available and falls back to CPU; Apple Silicon currently uses CPU, not Metal. Explicit `cuda` requires a compatible NVIDIA driver, CUDA 12 and cuDNN 9 libraries already available on the Host. The plugin does **not** install GPU drivers/system libraries. CPU uses INT8 where supported; GPU prefers FP16. Each Host has its own settings.
+
+### Privacy, downloads and disk lifecycle
+
+Audio is fetched from Telegram **only after access, binding and metadata checks**, processed locally, and removed from temporary storage after success, failure or cancellation. The transcript is sent back to Telegram and through the usual DSH session/model-provider path: local STT does **not** make the subsequent agent conversation offline. Neither audio nor transcripts are written to plugin diagnostic logs. Telegram retains the original message under its own policies.
+
+Initial setup needs access to GitHub (verified `uv` binary and managed Python), PyPI (pinned binary wheels) and Hugging Face (pinned model revisions/artifacts and their CDN). No audio is uploaded to those services. Subsequent recordings use the cached runtime/model without an STT network request. Telegram and the normal DSH model provider still need their usual connectivity.
+
+Artifacts live outside `node_modules` and survive npm updates:
+
+| Host | Runtime data | Model/download cache |
+| --- | --- | --- |
+| Linux | `$XDG_DATA_HOME/dsh-messenger/voice` or `~/.local/share/dsh-messenger/voice` | `$XDG_CACHE_HOME/dsh-messenger/voice` or `~/.cache/dsh-messenger/voice` |
+| macOS | `~/Library/Application Support/dsh-messenger/voice` | `~/Library/Caches/dsh-messenger/voice` |
+
+Idle means **no model process/memory**, not zero disk use. To remove cached models, stop the Host (or disable voice and wait for cancellation), then remove the cache's `models` directory; the next voice downloads the selected model again. Remove the whole voice data and cache directories to reset the installation. Do not remove them while another Host using the same OS account is working. An ungraceful OS/process kill can leave temporary audio or an installation lock; stop all affected Hosts before cleaning the cache's `audio` directory or the reported `.install-lock`. No automated disk-management/pre-download controls are exposed yet.
+
+The npm tarball contains the JS controller and `python/worker.py`, **not** Python, wheels or model weights. Core install pins and supported-platform checks live in `src/whisper-runtime.ts`; immutable model revisions live in `python/worker.py`.
+
 ## Architecture
 
 ```text
@@ -223,7 +283,7 @@ Bindings persist in the `messenger_bindings` storage domain. `NotificationStore`
 ## Roadmap
 
 - Add connection diagnostics and bot identity to the Web GUI.
-- Support attachments, images, and files.
+- Support attachments, images, files, and additional audio formats beyond voice messages.
 - Add Yandex Messenger and Discord adapters.
 - Add roles and more granular group-chat controls.
 

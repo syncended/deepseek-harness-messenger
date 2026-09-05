@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { InboundMessengerMessage, InboundVoiceMessage } from '../src/types.js';
 import {
   renderTelegramMarkdown,
   splitTelegramHtml,
@@ -42,6 +43,230 @@ function adapterWith(fetch: typeof globalThis.fetch, options: {
     ...(options.onError === undefined ? {} : { onError: options.onError }),
   });
 }
+
+const voiceMessage: InboundVoiceMessage = {
+  kind: 'voice', transport: 'telegram', chatId: '42', messageId: '8',
+  senderId: '42', text: '', voice: { fileId: 'voice-id', durationSeconds: 5 },
+};
+const voiceLimit = 20 * 1024 * 1024;
+
+async function mapVoiceUpdates(messages: object[]): Promise<{
+  received: InboundMessengerMessage[];
+  fetchMock: ReturnType<typeof vi.fn<typeof globalThis.fetch>>;
+}> {
+  const controller = new AbortController();
+  const received: InboundMessengerMessage[] = [];
+  const fetchMock = vi.fn<typeof globalThis.fetch>()
+    .mockResolvedValueOnce(jsonResponse(true))
+    .mockResolvedValueOnce(jsonResponse(true))
+    .mockResolvedValueOnce(jsonResponse([
+      ...messages.map((message, index) => ({ update_id: index + 1, message })),
+      messageUpdate(messages.length + 1, 999, 42, 'stop'),
+    ]))
+    .mockResolvedValue(jsonResponse([]));
+  await adapterWith(fetchMock).start(async (message) => {
+    if (message.text === 'stop') controller.abort();
+    else received.push(message);
+  }, controller.signal);
+  return { received, fetchMock };
+}
+
+function rawVoice(extra: object = {}): object {
+  return {
+    message_id: 8, chat: { id: 42, type: 'private' },
+    from: { id: 42, username: 'speaker' },
+    voice: { file_id: 'voice-id', duration: 5, file_size: 3, mime_type: 'audio/ogg' },
+    ...extra,
+  };
+}
+
+describe('TelegramAdapter voice mapping', () => {
+  it('maps voice metadata without downloading and acknowledges before delivery', async () => {
+    const { received, fetchMock } = await mapVoiceUpdates([rawVoice()]);
+    expect(received).toEqual([{
+      ...voiceMessage, chatKind: 'private', senderName: '@speaker',
+      voice: { fileId: 'voice-id', durationSeconds: 5, sizeBytes: 3, mimeType: 'audio/ogg' },
+    }]);
+    expect(fetchMock.mock.calls.every(([url]) => !String(url).includes('getFile'))).toBe(true);
+    expect(JSON.parse(String(fetchMock.mock.calls[3]?.[1]?.body))).toMatchObject({ offset: 3, timeout: 0 });
+  });
+
+  it('requires a real explicit sender and does not treat audio or documents as voice', async () => {
+    const { received } = await mapVoiceUpdates([
+      rawVoice({ from: undefined }), rawVoice({ from: null }),
+      rawVoice({ from: { id: '42' } }), rawVoice({ from: { id: 0 } }),
+      rawVoice({ from: { id: 42, is_bot: true } }),
+      rawVoice({ sender_chat: { id: 42 } }),
+      rawVoice({ voice: undefined, audio: { file_id: 'audio' } }),
+      rawVoice({ voice: undefined, document: { file_id: 'doc' } }),
+    ]);
+    expect(received).toEqual([]);
+  });
+
+  it('rejects malformed duration and size metadata but accepts absent optional fields', async () => {
+    const invalid = [-1, Number.NaN, Number.POSITIVE_INFINITY, '5', null];
+    const { received } = await mapVoiceUpdates([
+      ...invalid.map((duration) => rawVoice({ voice: { file_id: 'voice-id', duration } })),
+      ...[...invalid, 1.5].map((file_size) => rawVoice({
+        voice: { file_id: 'voice-id', duration: 5, file_size },
+      })),
+      rawVoice({ voice: { file_id: '', duration: 5 } }),
+      rawVoice({ voice: { file_id: 'voice-id', duration: 0 } }),
+    ]);
+    expect(received).toHaveLength(1);
+    expect(received[0]).toMatchObject({ voice: { fileId: 'voice-id', durationSeconds: 0 } });
+    expect(received[0]).not.toHaveProperty('voice.sizeBytes');
+  });
+});
+
+describe('TelegramAdapter voice download', () => {
+  it('uses getFile then the fixed Telegram file endpoint and collects streamed bytes', async () => {
+    const fetchMock = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(jsonResponse({ file_path: 'voice/file_9.oga', file_size: 3 }))
+      .mockResolvedValueOnce(new Response(new Uint8Array([1, 2, 3])));
+    expect(await adapterWith(fetchMock).downloadVoice(voiceMessage, new AbortController().signal))
+      .toEqual(new Uint8Array([1, 2, 3]));
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://api.telegram.org/bottest-token/getFile');
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({ file_id: 'voice-id' });
+    expect(fetchMock.mock.calls[1]?.[0]).toBe('https://api.telegram.org/file/bottest-token/voice/file_9.oga');
+    expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({ redirect: 'error', signal: expect.any(AbortSignal) });
+  });
+
+  it.each(['message', 'getFile', 'content-length'])('rejects oversized advertised %s size', async (source) => {
+    const fetchMock = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(jsonResponse({
+        file_path: 'voice/file.oga', ...(source === 'getFile' ? { file_size: voiceLimit + 1 } : {}),
+      }))
+      .mockResolvedValueOnce(new Response('small', { headers: { 'content-length': String(voiceLimit + 1) } }));
+    const message = source === 'message'
+      ? { ...voiceMessage, voice: { ...voiceMessage.voice, sizeBytes: voiceLimit + 1 } }
+      : voiceMessage;
+    await expect(adapterWith(fetchMock).downloadVoice(message, new AbortController().signal)).rejects.toThrow('20 MB');
+    expect(fetchMock).toHaveBeenCalledTimes(source === 'message' ? 0 : source === 'getFile' ? 1 : 2);
+  });
+
+  it.each([undefined, '1'])('enforces the streamed limit despite content-length %s', async (advertised) => {
+    const cancel = vi.fn();
+    let index = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(new Uint8Array(index++ < 20 ? 1024 * 1024 : 1));
+      },
+      cancel,
+    });
+    const fetchMock = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(jsonResponse({ file_path: 'voice/file.oga', file_size: 1 }))
+      .mockResolvedValueOnce(new Response(body, advertised === undefined ? {} : {
+        headers: { 'content-length': advertised },
+      }));
+    await expect(adapterWith(fetchMock).downloadVoice(voiceMessage, new AbortController().signal))
+      .rejects.toThrow('20 MB');
+    expect(cancel).toHaveBeenCalled();
+  });
+
+  it.each([
+    '../secret', 'voice/../secret', '/voice/file.oga', 'https://evil.test/a',
+    '//evil.test/a', 'voice/%2e%2e/a', 'voice/a?token=x', 'voice/a#x',
+    'voice\\file.oga', 'voice//file.oga', 'voice/./file.oga', '', null,
+  ])('rejects unsafe getFile path %s without fetching it', async (file_path) => {
+    const fetchMock = vi.fn<typeof globalThis.fetch>().mockResolvedValue(jsonResponse({ file_path }));
+    await expect(adapterWith(fetchMock).downloadVoice(voiceMessage, new AbortController().signal))
+      .rejects.toThrow('invalid Telegram file path');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['request', 'runtime', 'timeout'])('aborts stalled streaming via %s', async (source) => {
+    const request = new AbortController();
+    const runtime = new AbortController();
+    const cancel = vi.fn();
+    const fetchMock = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(jsonResponse({ file_path: 'voice/file.oga' }))
+      .mockResolvedValueOnce(new Response(new ReadableStream<Uint8Array>({ cancel })));
+    const adapter = new TelegramAdapter({
+      token: 'test-token', pollTimeoutSeconds: 30, requestTimeoutMs: source === 'timeout' ? 20 : 1000,
+      fetch: fetchMock, signal: runtime.signal,
+    });
+    const pending = expect(adapter.downloadVoice(voiceMessage, request.signal)).rejects.toThrow('aborted or timed out');
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    if (source === 'request') request.abort(new Error('secret reason test-token'));
+    if (source === 'runtime') runtime.abort(new Error('secret reason test-token'));
+    await pending;
+    expect(cancel).toHaveBeenCalled();
+  });
+
+  it('accepts exactly the byte limit', async () => {
+    const fetchMock = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(jsonResponse({ file_path: 'voice/a' }))
+      .mockResolvedValueOnce(new Response(new Uint8Array(voiceLimit)));
+    const bytes = await adapterWith(fetchMock).downloadVoice(voiceMessage, new AbortController().signal);
+    expect(bytes.byteLength).toBe(voiceLimit);
+  });
+
+  it.each(['getFile', 'download'])('aborts a stalled %s request even if fetch ignores abort', async (stage) => {
+    const request = new AbortController();
+    const fetchMock = vi.fn<typeof globalThis.fetch>(async (url) => {
+      if (stage === 'download' && String(url).endsWith('/getFile')) {
+        return jsonResponse({ file_path: 'voice/a' });
+      }
+      return await new Promise<Response>(() => {});
+    });
+    const pending = expect(adapterWith(fetchMock).downloadVoice(voiceMessage, request.signal))
+      .rejects.toThrow('aborted or timed out');
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(stage === 'getFile' ? 1 : 2));
+    request.abort();
+    await pending;
+  });
+
+  it.each([-1, 0.5, 'secret', null])('rejects invalid getFile size %s', async (file_size) => {
+    const fetchMock = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValue(jsonResponse({ file_path: 'voice/a', file_size }));
+    await expect(adapterWith(fetchMock).downloadVoice(voiceMessage, new AbortController().signal))
+      .rejects.toThrow('invalid voice size');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not reflect file HTTP failure bodies', async () => {
+    const fetchMock = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(jsonResponse({ file_path: 'voice/a' }))
+      .mockResolvedValueOnce(new Response('secret test-token', { status: 403 }));
+    await expect(adapterWith(fetchMock).downloadVoice(voiceMessage, new AbortController().signal))
+      .rejects.toThrow('Telegram downloadVoice failed: HTTP 403');
+  });
+
+  it('makes no request when already aborted', async () => {
+    const fetchMock = vi.fn<typeof globalThis.fetch>();
+    await expect(adapterWith(fetchMock).downloadVoice(voiceMessage, AbortSignal.abort('test-token')))
+      .rejects.toThrow('aborted or timed out');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['getFile', 'download', 'stream', 'api-description', 'credential', 'abort'])('redacts %s failures', async (source) => {
+    const secret = 'https://api.telegram.org/file/bottest-token/voice/a';
+    const request = new AbortController();
+    const fetchMock = vi.fn<typeof globalThis.fetch>(async (url) => {
+      if (source === 'getFile') throw new Error(secret);
+      if (source === 'api-description') return new Response(JSON.stringify({
+        ok: false, description: `Bad request ${secret} test-token https://user:password@evil.test/a`,
+      }), { status: 400 });
+      if (String(url).endsWith('/getFile')) return jsonResponse({ file_path: 'voice/a' });
+      if (source === 'abort') request.abort(new Error(secret));
+      if (source === 'stream') return new Response(new ReadableStream({
+        start(controller) { controller.error(new Error(secret)); },
+      }));
+      throw new Error(secret);
+    });
+    const adapter = new TelegramAdapter({
+      token: source === 'credential' ? async () => { throw new Error(secret); } : 'test-token',
+      pollTimeoutSeconds: 30, requestTimeoutMs: 1000, fetch: fetchMock,
+    });
+    const error: unknown = await adapter.downloadVoice(voiceMessage, request.signal).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(TelegramApiError);
+    const serialized = `${String(error)} ${JSON.stringify(error)}`;
+    expect(serialized).not.toContain('test-token');
+    expect(serialized).not.toContain('https://');
+    expect(serialized).not.toContain('password');
+  });
+});
 
 describe('renderTelegramMarkdown', () => {
   it('renders common model Markdown with Telegram HTML', () => {
@@ -155,6 +380,7 @@ describe('TelegramAdapter credentials', () => {
       'context',
       'steer',
       'cancel',
+      'voice_cancel',
       'unbind',
       'notifications',
       'help',

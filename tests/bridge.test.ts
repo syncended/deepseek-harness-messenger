@@ -6,12 +6,14 @@ import { MemoryMessengerBindingStore } from '../src/store.js';
 import type {
   InboundCallbackInteraction,
   InboundTextMessage,
+  InboundVoiceMessage,
   MessengerAdapter,
   MessengerInlineKeyboard,
   MessengerMessageHandle,
   SendTextOptions,
 } from '../src/types.js';
 import type { SessionEvent } from '@deepseek-ai/dsh-session';
+import type { VoiceTranscriber } from '../src/voice.js';
 
 class FakeAdapter implements MessengerAdapter {
   readonly id = 'telegram';
@@ -2050,6 +2052,333 @@ describe('MessengerBridge controls', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('voice message routing', () => {
+  function voiceMessage(overrides: Partial<InboundVoiceMessage> = {}): InboundVoiceMessage {
+    return { ...message(''), kind: 'voice', voice: { fileId: 'voice-1', durationSeconds: 10, sizeBytes: 100 }, ...overrides };
+  }
+
+  function setup() {
+    const context = fakeContext();
+    const adapter = Object.assign(new FakeAdapter(), {
+      downloadVoice: vi.fn(async () => new Uint8Array([1, 2, 3])),
+    });
+    const requests: Array<{
+      request: Parameters<VoiceTranscriber['transcribe']>[0];
+      resolve: (text: string) => void;
+      reject: (error: Error) => void;
+    }> = [];
+    const voice = {
+      transcribe: vi.fn((request: Parameters<VoiceTranscriber['transcribe']>[0]) => new Promise<string>((resolve, reject) => {
+        requests.push({ request, resolve, reject });
+        request.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      })),
+      dispose: vi.fn(async () => {}),
+    };
+    const bridge = new MessengerBridge(context.ctx, {
+      allowedChatIds: ['100'], allowedUserIds: [], privateChatsOnly: true, voice,
+    });
+    bridge.registerAdapter(adapter);
+    return { ...context, adapter, bridge, voice, requests };
+  }
+
+  it('does not initialize/download for unauthorized, unbound or oversized recordings', async () => {
+    const { bridge, voice, adapter } = setup();
+    try {
+      await bridge.handle(voiceMessage({ chatId: '999' }));
+      expect(adapter.sent).toHaveLength(0);
+      await bridge.handle(voiceMessage());
+      expect(adapter.sent.at(-1)?.text).toContain('No session');
+      await bridge.handle(message('/use session-1'));
+      await bridge.handle(voiceMessage({ voice: { fileId: 'v', durationSeconds: 301 } }));
+      await bridge.handle(voiceMessage({ voice: { fileId: 'v', durationSeconds: 10, sizeBytes: 21 * 1024 * 1024 } }));
+      expect(voice.transcribe).not.toHaveBeenCalled();
+      expect(adapter.downloadVoice).not.toHaveBeenCalled();
+    } finally { await bridge.dispose(); }
+  });
+
+  it('accepts zero-second metadata for nonempty sub-second voice recordings', async () => {
+    const { bridge, requests, prompt, adapter } = setup();
+    try {
+      await bridge.handle(message('/use session-1'));
+      await bridge.handle(voiceMessage({ voice: { fileId: 'short-voice', durationSeconds: 0, sizeBytes: 3 } }));
+      expect(requests).toHaveLength(1);
+      await requests[0]!.request.loadAudio(requests[0]!.request.signal);
+      expect(adapter.downloadVoice).toHaveBeenCalledOnce();
+      requests[0]!.resolve('yes');
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce());
+    } finally { await bridge.dispose(); }
+  });
+
+  it('submits recognized slash text as content, never a messenger command', async () => {
+    const { bridge, requests, prompt, adapter, voice } = setup();
+    try {
+      await bridge.handle(message('/use session-1'));
+      await bridge.handle(voiceMessage());
+      await requests[0]!.request.loadAudio(requests[0]!.request.signal);
+      expect(adapter.downloadVoice).toHaveBeenCalledOnce();
+      requests[0]!.resolve('/new do not execute as a command');
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce());
+      expect(prompt.mock.calls[0]).toEqual([expect.objectContaining({
+        sessionId: 'session-1', content: [{ type: 'text', text: '/new do not execute as a command' }], mode: 'queue',
+      }), expect.any(AbortSignal)]);
+      expect(adapter.edits.some((edit) => edit.text.includes('Recognized:'))).toBe(true);
+    } finally { await bridge.dispose(); }
+    expect(voice.dispose).toHaveBeenCalledOnce();
+  });
+
+  it('keeps commands responsive and cancels only the operator\'s pending work', async () => {
+    const { bridge, requests, sessions, prompt } = setup();
+    try {
+      await bridge.handle(message('/use session-1'));
+      await bridge.handle(voiceMessage());
+      await bridge.handle(message('/status'));
+      await bridge.handle(message('/voice_cancel', '999'));
+      expect(requests[0]!.request.signal.aborted).toBe(false);
+      await bridge.handle(message('/voice_cancel'));
+      expect(requests[0]!.request.signal.aborted).toBe(true);
+      expect(sessions.cancel).not.toHaveBeenCalled();
+      expect(prompt).not.toHaveBeenCalled();
+    } finally { await bridge.dispose(); }
+  });
+
+  it('scopes the cancellation button to its originating operator', async () => {
+    const { bridge, requests, adapter } = setup();
+    try {
+      await bridge.handle(message('/use session-1'));
+      await bridge.handle(voiceMessage());
+      const data = callbackFor(adapter, 'Cancel transcription');
+      await bridge.handle(callback(data, '200'));
+      expect(requests[0]!.request.signal.aborted).toBe(false);
+      await bridge.handle(callback(data));
+      expect(requests[0]!.request.signal.aborted).toBe(true);
+    } finally { await bridge.dispose(); }
+  });
+
+  it('does not retarget a transcript after unbind and rebind to the same session', async () => {
+    const { bridge, requests, prompt, adapter } = setup();
+    try {
+      await bridge.handle(message('/use session-1'));
+      await bridge.handle(voiceMessage());
+      await bridge.handle(message('/unbind'));
+      await bridge.handle(message('/use session-1'));
+      requests[0]!.resolve('old request');
+      await vi.waitFor(() => expect(adapter.sent.some((sent) => sent.text.includes('Transcript not sent'))).toBe(true));
+      expect(prompt).not.toHaveBeenCalled();
+    } finally { await bridge.dispose(); }
+  });
+
+  it('rejects stale targets before downloading queued audio', async () => {
+    const { bridge, requests, adapter } = setup();
+    try {
+      await bridge.handle(message('/use session-1'));
+      await bridge.handle(voiceMessage());
+      await bridge.handle(message('/unbind'));
+      await expect(requests[0]!.request.loadAudio(requests[0]!.request.signal)).rejects.toThrow('changed');
+      expect(adapter.downloadVoice).not.toHaveBeenCalled();
+    } finally { await bridge.dispose(); }
+  });
+
+  it('answers the captured question with recognized speech', async () => {
+    const { bridge, requests, prompt, respond } = setup();
+    try {
+      await bridge.handle(message('/use session-1'));
+      await bridge.onQuestionRequested('q-voice', 'session-1', [{ id: 'q1', question: 'Which branch?' }], submitWith(respond, 'q-voice'));
+      await bridge.handle(voiceMessage());
+      requests[0]!.resolve('feature voice');
+      await vi.waitFor(() => expect(respond).toHaveBeenCalledOnce());
+      expect(respond).toHaveBeenCalledWith(expect.objectContaining({
+        answer: { answers: [{ id: 'q1', selected: [], custom: 'feature voice' }] },
+      }));
+      expect(prompt).not.toHaveBeenCalled();
+    } finally { await bridge.dispose(); }
+  });
+
+  it('does not answer a different question that advanced during transcription', async () => {
+    const { bridge, requests, prompt, respond, adapter } = setup();
+    try {
+      await bridge.handle(message('/use session-1'));
+      await bridge.onQuestionRequested('q-voice', 'session-1', [
+        { id: 'q1', question: 'Which branch?' }, { id: 'q2', question: 'Run tests?' },
+      ], submitWith(respond, 'q-voice'));
+      await bridge.handle(voiceMessage());
+      await bridge.handle(message('main'));
+      requests[0]!.resolve('feature voice');
+      await vi.waitFor(() => expect(adapter.sent.some((sent) => sent.text.includes('Transcript not sent'))).toBe(true));
+      expect(respond).not.toHaveBeenCalled();
+      expect(prompt).not.toHaveBeenCalled();
+    } finally { await bridge.dispose(); }
+  });
+
+  it('does not turn an earlier prompt into an answer to a newly appearing question', async () => {
+    const { bridge, requests, prompt, respond, adapter } = setup();
+    try {
+      await bridge.handle(message('/use session-1'));
+      await bridge.handle(voiceMessage());
+      await bridge.onQuestionRequested('new-q', 'session-1', [{ id: 'q', question: 'Continue?' }], submitWith(respond, 'new-q'));
+      requests[0]!.resolve('run tests');
+      await vi.waitFor(() => expect(adapter.sent.some((sent) => sent.text.includes('Transcript not sent'))).toBe(true));
+      expect(respond).not.toHaveBeenCalled();
+      expect(prompt).not.toHaveBeenCalled();
+    } finally { await bridge.dispose(); }
+  });
+
+  it('preserves transcript submission order even if later transcription resolves first', async () => {
+    const { bridge, requests, prompt } = setup();
+    try {
+      await bridge.handle(message('/use session-1'));
+      await bridge.handle(voiceMessage());
+      await bridge.handle(voiceMessage());
+      requests[1]!.resolve('second');
+      await Promise.resolve();
+      expect(prompt).not.toHaveBeenCalled();
+      requests[0]!.resolve('first');
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(2));
+      expect(prompt.mock.calls).toEqual([
+        [expect.objectContaining({ content: [{ type: 'text', text: 'first' }] }), expect.any(AbortSignal)],
+        [expect.objectContaining({ content: [{ type: 'text', text: 'second' }] }), expect.any(AbortSignal)],
+      ]);
+    } finally { await bridge.dispose(); }
+  });
+
+  it('cancels a resolved later voice without waiting for an earlier presentation tail', async () => {
+    const { bridge, requests, prompt, adapter } = setup();
+    await bridge.handle(message('/use session-1'));
+    let releasePlaceholder!: (handle: MessengerMessageHandle) => void;
+    const placeholder = new Promise<MessengerMessageHandle>((resolve) => { releasePlaceholder = resolve; });
+    vi.spyOn(adapter, 'sendText').mockImplementationOnce(async () => placeholder);
+    try {
+      await bridge.handle(voiceMessage());
+      await bridge.handle(voiceMessage());
+      const cancelSecond = callbackFor(adapter, 'Cancel transcription');
+      const secondStatusId = String(adapter.sent.length);
+      requests[0]!.resolve('first transcript');
+      requests[1]!.resolve('second transcript');
+      // First waits for its placeholder; second waits for the first job's tail.
+      for (let index = 0; index < 10; index += 1) await Promise.resolve();
+      expect(prompt).not.toHaveBeenCalled();
+      await bridge.handle(callback(cancelSecond));
+      expect(requests[0]!.request.signal.aborted).toBe(false);
+      expect(requests[1]!.request.signal.aborted).toBe(true);
+      await vi.waitFor(() => expect(adapter.edits.some((edit) => (
+        edit.messageId === secondStatusId && edit.text.includes('Voice transcription cancelled')
+      ))).toBe(true));
+      expect(prompt).not.toHaveBeenCalled();
+      releasePlaceholder({ chatId: '100', messageId: 'first-voice-placeholder' });
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce());
+      expect(prompt.mock.calls[0]).toEqual([expect.objectContaining({
+        content: [{ type: 'text', text: 'first transcript' }],
+      }), expect.any(AbortSignal)]);
+    } finally {
+      releasePlaceholder({ chatId: '100', messageId: 'first-voice-placeholder' });
+      await bridge.dispose();
+    }
+  });
+
+  it('does not let a later voice overtake the first when the middle voice is cancelled', async () => {
+    const { bridge, requests, prompt, adapter } = setup();
+    try {
+      await bridge.handle(message('/use session-1'));
+      await bridge.handle(voiceMessage());
+      await bridge.handle(voiceMessage());
+      const cancelMiddle = callbackFor(adapter, 'Cancel transcription');
+      await bridge.handle(voiceMessage());
+      await bridge.handle(callback(cancelMiddle));
+      requests[2]!.resolve('third');
+      for (let index = 0; index < 20; index += 1) await Promise.resolve();
+      expect(prompt).not.toHaveBeenCalled();
+      requests[0]!.resolve('first');
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(2));
+      expect(prompt.mock.calls).toEqual([
+        [expect.objectContaining({ content: [{ type: 'text', text: 'first' }] }), expect.any(AbortSignal)],
+        [expect.objectContaining({ content: [{ type: 'text', text: 'third' }] }), expect.any(AbortSignal)],
+      ]);
+    } finally { await bridge.dispose(); }
+  });
+
+  it('bounds per-user pending work and shuts down all jobs on disposal', async () => {
+    const { bridge, requests, voice, prompt, adapter } = setup();
+    await bridge.handle(message('/use session-1'));
+    for (let index = 0; index < 4; index += 1) await bridge.handle(voiceMessage());
+    expect(voice.transcribe).toHaveBeenCalledTimes(3);
+    expect(adapter.sent.at(-1)?.text).toContain('queue is full');
+    await bridge.dispose();
+    expect(requests.every(({ request }) => request.signal.aborted)).toBe(true);
+    expect(prompt).not.toHaveBeenCalled();
+  });
+
+  it('does not publish late voice status after disposal while the placeholder is pending', async () => {
+    const { bridge, requests, prompt, adapter } = setup();
+    await bridge.handle(message('/use session-1'));
+    let releasePlaceholder!: (handle: MessengerMessageHandle) => void;
+    const placeholder = new Promise<MessengerMessageHandle>((resolve) => { releasePlaceholder = resolve; });
+    const send = vi.spyOn(adapter, 'sendText').mockReturnValue(placeholder);
+    const edit = vi.spyOn(adapter, 'editText');
+    try {
+      await bridge.handle(voiceMessage());
+      requests[0]!.resolve('ready before shutdown');
+      // Drain the resolved transcription, preceding-job, and progress-edit awaits
+      // so finish is suspended specifically on the unresolved placeholder.
+      for (let index = 0; index < 10; index += 1) await Promise.resolve();
+      expect(send).toHaveBeenCalledOnce();
+      expect(edit).not.toHaveBeenCalled();
+      const stopping = bridge.dispose();
+      releasePlaceholder({ chatId: '100', messageId: 'late-placeholder' });
+      await stopping;
+      expect(edit).not.toHaveBeenCalled();
+      expect(send).toHaveBeenCalledOnce();
+      expect(prompt).not.toHaveBeenCalled();
+    } finally {
+      releasePlaceholder({ chatId: '100', messageId: 'late-placeholder' });
+      await bridge.dispose();
+    }
+  });
+
+  it.each([true, false])('routes recognized content despite presentation failure (placeholder fails: %s)', async (failPlaceholder) => {
+    const { bridge, requests, prompt, adapter } = setup();
+    try {
+      await bridge.handle(message('/use session-1'));
+      const send = vi.spyOn(adapter, 'sendText').mockRejectedValue(new Error('transport unavailable'));
+      if (!failPlaceholder) send.mockResolvedValueOnce({ chatId: '100', messageId: 'placeholder' });
+      const edit = vi.spyOn(adapter, 'editText').mockRejectedValue(new Error('message deleted'));
+      await bridge.handle(voiceMessage());
+      requests[0]!.resolve('submit even without Telegram status');
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce());
+      expect(prompt.mock.calls[0]).toEqual([expect.objectContaining({
+        sessionId: 'session-1', content: [{ type: 'text', text: 'submit even without Telegram status' }], mode: 'queue',
+      }), expect.any(AbortSignal)]);
+      expect(send.mock.calls.some(([, text]) => text.includes('Recognized:'))).toBe(true);
+      if (!failPlaceholder) expect(edit).toHaveBeenCalled();
+    } finally { await bridge.dispose(); }
+  });
+
+  it('preserves the full recognized status on adapters without replaceText', async () => {
+    const { bridge, requests, prompt, adapter } = setup();
+    try {
+      await bridge.handle(message('/use session-1'));
+      await bridge.handle(voiceMessage());
+      const transcript = 'speech '.repeat(600);
+      requests[0]!.resolve(transcript);
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce());
+      expect(adapter.sent.some((sent) => sent.text === `🎙 Recognized:\n\n${transcript.trim()}`)).toBe(true);
+      expect(adapter.edits.some((edit) => edit.text === '🎙 Transcription complete.')).toBe(true);
+    } finally { await bridge.dispose(); }
+  });
+
+  it('does not submit empty speech or failed recognition', async () => {
+    const { bridge, requests, prompt, adapter } = setup();
+    try {
+      await bridge.handle(message('/use session-1'));
+      await bridge.handle(voiceMessage());
+      requests[0]!.resolve('   ');
+      await vi.waitFor(() => expect(adapter.edits.some((edit) => edit.text.includes('No speech'))).toBe(true));
+      await bridge.handle(voiceMessage());
+      requests[1]!.reject(new Error('Local model unavailable'));
+      await vi.waitFor(() => expect(adapter.edits.some((edit) => edit.text.includes('Local model unavailable'))).toBe(true));
+      expect(prompt).not.toHaveBeenCalled();
+    } finally { await bridge.dispose(); }
   });
 });
 

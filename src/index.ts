@@ -12,10 +12,13 @@ import {
   type MessengerBindingStore,
 } from './store.js';
 import { TelegramAdapter } from './telegram.js';
+import { DEFAULT_VOICE_CONFIG, LocalWhisperTranscriber, type VoiceConfig } from './voice.js';
 import { installNotificationTool } from './notifications.js';
 import { openNotificationStore, type NotificationStore } from './notification-store.js';
 
 export { MessengerBridge, parseCommand } from './bridge.js';
+export { LocalWhisperTranscriber, DEFAULT_VOICE_CONFIG } from './voice.js';
+export type { VoiceConfig, VoiceTranscriber } from './voice.js';
 export { TelegramAdapter, TelegramApiError, splitTelegramText } from './telegram.js';
 export {
   DurableMessengerBindingStore,
@@ -28,6 +31,7 @@ export {
 export type { MessengerBindingRecord, MessengerBindingStore } from './store.js';
 export type {
   InboundMessengerMessage,
+  InboundVoiceMessage,
   MessengerAdapter,
   ParsedCommand,
 } from './types.js';
@@ -62,6 +66,8 @@ export interface TelegramConfig {
 
 export interface Config {
   telegram: TelegramConfig;
+  /** Optional for compatibility with existing entry configurations. */
+  voice?: VoiceConfig;
 }
 
 export const Config: z<Config> = z.object({
@@ -78,6 +84,11 @@ export const Config: z<Config> = z.object({
     pollTimeoutSeconds: z.number().min(1).max(50).default(30),
     requestTimeoutMs: z.number().min(1_000).max(120_000).default(15_000),
   }),
+  voice: z.object({
+    enabled: z.boolean().default(true),
+    model: z.union(['tiny', 'base', 'small', 'medium', 'large-v3', 'turbo']).default('small'),
+    device: z.union(['auto', 'cpu', 'cuda']).default('auto'),
+  }).default(DEFAULT_VOICE_CONFIG),
 });
 
 interface TelegramRuntime {
@@ -107,6 +118,7 @@ async function startTelegramRuntime(
   bindingStore: MessengerBindingStore,
   beforeActivate: () => Promise<void>,
   notificationStore: NotificationStore,
+  voiceConfig: VoiceConfig,
 ): Promise<TelegramRuntime> {
   if (config.allowedChatIds.length === 0) {
     ctx.logger.warn(
@@ -172,6 +184,7 @@ async function startTelegramRuntime(
       allowedUserIds: config.allowedUserIds,
       privateChatsOnly: config.privateChatsOnly,
       notificationStore,
+      ...(voiceConfig.enabled ? { voice: new LocalWhisperTranscriber(voiceConfig) } : {}),
     }, bindingStore);
     bridge.registerAdapter(adapter);
     await beforeActivate();
@@ -236,6 +249,12 @@ async function startTelegramRuntime(
 }
 
 export function validateMessengerConfig(config: Config): void {
+  const voice = config.voice ?? DEFAULT_VOICE_CONFIG;
+  if (typeof voice.enabled !== 'boolean'
+    || !['tiny', 'base', 'small', 'medium', 'large-v3', 'turbo'].includes(voice.model)
+    || !['auto', 'cpu', 'cuda'].includes(voice.device)) {
+    throw new Error('Invalid local Whisper voice settings');
+  }
   const telegram = config.telegram;
   if (telegram.tokenRef !== TELEGRAM_BOT_TOKEN_REF) {
     throw new Error(`Telegram credential reference must be ${TELEGRAM_BOT_TOKEN_REF}`);
@@ -326,6 +345,7 @@ export async function apply(ctx: Context, entryConfig: Config): Promise<void> {
             if (active === previous) active = undefined;
           },
           notificationStore,
+          current.voice ?? DEFAULT_VOICE_CONFIG,
         );
         if (disposed || requestedGeneration !== generation) {
           await next.stop();

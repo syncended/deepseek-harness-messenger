@@ -12,6 +12,7 @@ import type { SessionController } from '@deepseek-ai/dsh-api-session-controller'
 import { DshControl, sessionTitle, visibleAssistantText } from './control.js';
 import { splitTelegramText } from './telegram.js';
 import type { NotificationStore, Subscription } from './notification-store.js';
+import { abortable, type VoiceTranscriber } from './voice.js';
 import {
   MemoryMessengerBindingStore,
   messengerBindingIdentity,
@@ -23,6 +24,7 @@ import type {
   InboundCallbackInteraction,
   InboundMessengerMessage,
   InboundTextMessage,
+  InboundVoiceMessage,
   MessengerAdapter,
   MessengerChatKind,
   MessengerInlineKeyboard,
@@ -69,13 +71,27 @@ export type BridgeContext = {
 };
 
 export interface MessengerBridgeOptions {
+  /** Bridge owns this service and disposes it with the runtime. */
+  readonly voice?: VoiceTranscriber;
   readonly notificationStore?: NotificationStore;
   readonly allowedChatIds: readonly string[];
   readonly allowedUserIds: readonly string[];
   readonly privateChatsOnly: boolean;
 }
 
+interface VoiceJob {
+  readonly id: string;
+  readonly key: string;
+  readonly controller: AbortController;
+  readonly sessionId: string;
+  readonly bindingRevision: number;
+  readonly question: PendingQuestionState | undefined;
+  readonly questionIndex: number | undefined;
+  task: Promise<void>;
+}
+
 type CallbackAction =
+  | { readonly kind: 'voice-cancel'; readonly jobId: string }
   | { readonly kind: 'menu' }
   | { readonly kind: 'sessions'; readonly page: number }
   | { readonly kind: 'bind'; readonly sessionId: string }
@@ -250,6 +266,7 @@ function helpText(): string {
     '/context — show context and token usage',
     '/steer <text> — steer the active turn',
     '/cancel — cancel the active turn',
+    '/voice_cancel — cancel your pending voice transcriptions',
     '/unbind — remove the binding',
     '/notifications on|off — enable or disable persistent Host-wide notifications',
     '/help — show this help',
@@ -523,6 +540,8 @@ export class MessengerBridge {
   private readonly resolvingQuestions = new Set<string>();
   private readonly control: DshControl;
   private readonly notificationStore: NotificationStore | undefined;
+  private readonly voice: VoiceTranscriber | undefined;
+  private readonly voiceJobs = new Map<string, VoiceJob>();
   private nextThinkingOffset = 0;
   private disposed = false;
 
@@ -536,6 +555,7 @@ export class MessengerBridge {
     this.privateChatsOnly = options.privateChatsOnly;
     this.control = new DshControl(ctx);
     this.notificationStore = options.notificationStore;
+    this.voice = options.voice;
   }
 
   async restoreBindings(): Promise<void> {
@@ -623,6 +643,10 @@ export class MessengerBridge {
     }
 
     const key = bindingKey(adapter.id, message.chatId, message.senderId);
+    if (message.kind === 'voice') {
+      await this.enqueueAction(key, () => this.acceptVoice(adapter, message));
+      return;
+    }
     if (parseCommand(message.text) === undefined && !this.bindings.has(key)) {
       await adapter.sendText(
         message.chatId,
@@ -634,11 +658,162 @@ export class MessengerBridge {
     await this.enqueueAction(key, () => this.handleTextMessage(adapter, message));
   }
 
+  private cancelVoice(key: string, jobId?: string): number {
+    let count = 0;
+    for (const job of this.voiceJobs.values()) {
+      if (job.key !== key || (jobId !== undefined && job.id !== jobId) || job.controller.signal.aborted) continue;
+      job.controller.abort(new Error('Voice transcription cancelled.'));
+      count += 1;
+    }
+    return count;
+  }
+
+  private voiceTargetCurrent(job: VoiceJob): boolean {
+    return !this.disposed && !job.controller.signal.aborted
+      && this.bindings.get(job.key) === job.sessionId
+      && (this.bindingRevisions.get(job.key) ?? 0) === job.bindingRevision
+      && this.pendingQuestions.get(job.key) === job.question
+      && job.question?.index === job.questionIndex
+      && (job.question === undefined || !this.resolvingQuestions.has(job.question.rpcId));
+  }
+
+  private async acceptVoice(adapter: MessengerAdapter, message: InboundVoiceMessage): Promise<void> {
+    const key = bindingKey(adapter.id, message.chatId, message.senderId);
+    const sessionId = this.bindings.get(key);
+    if (sessionId === undefined) {
+      await adapter.sendText(message.chatId, 'No session selected. Use /resume or /new before sending a voice message.');
+      return;
+    }
+    if (this.voice === undefined || adapter.downloadVoice === undefined) {
+      await adapter.sendText(message.chatId, 'Local voice transcription is disabled or unavailable. Enable Local Whisper in Settings → Messengers.');
+      return;
+    }
+    const { durationSeconds, sizeBytes } = message.voice;
+    if (!Number.isFinite(durationSeconds) || durationSeconds < 0 || durationSeconds > 300
+      || (sizeBytes !== undefined && (!Number.isSafeInteger(sizeBytes) || sizeBytes <= 0 || sizeBytes > 20 * 1024 * 1024))) {
+      await adapter.sendText(message.chatId, 'Voice messages must be at most 5 minutes and 20 MiB.');
+      return;
+    }
+    if (this.voiceJobs.size >= 8 || [...this.voiceJobs.values()].filter((job) => job.key === key).length >= 3) {
+      await adapter.sendText(message.chatId, 'The voice queue is full. Wait for transcription or use /voice_cancel.');
+      return;
+    }
+    const question = this.pendingQuestions.get(key);
+    const job: VoiceJob = {
+      id: randomUUID(), key, controller: new AbortController(), sessionId,
+      bindingRevision: this.bindingRevisions.get(key) ?? 0,
+      question, questionIndex: question?.index, task: Promise.resolve(),
+    };
+    // Wait for every earlier live job: a cancelled middle job can finish before
+    // its predecessor and must not let a later successful transcript overtake it.
+    const previous = Promise.all([...this.voiceJobs.values()]
+      .filter((candidate) => candidate.key === key).map((candidate) => candidate.task)).then(() => {});
+    this.voiceJobs.set(job.id, job);
+    // Do not await long-running work on the adapter's chat tail or action queue.
+    job.task = this.runVoice(adapter, message, job, previous).catch(() => {
+      if (!this.disposed) this.ctx.logger.warn('messenger: could not deliver voice transcription status');
+    }).finally(() => {
+      this.voiceJobs.delete(job.id);
+      for (const [token, record] of this.callbacks) {
+        if (record.action.kind === 'voice-cancel' && record.action.jobId === job.id) this.callbacks.delete(token);
+      }
+    });
+  }
+
+  private async runVoice(adapter: MessengerAdapter, message: InboundVoiceMessage, job: VoiceJob, previous: Promise<void>): Promise<void> {
+    const keyboard = callbackKeyboard([[
+      this.button(adapter.id, message.chatId, message.senderId, 'Cancel transcription', { kind: 'voice-cancel', jobId: job.id }),
+    ]]);
+    const handlePromise = adapter.sendText(message.chatId, '🎙 Preparing local transcription… First use downloads the runtime and model. /voice_cancel to cancel.', { keyboard })
+      .catch(() => undefined);
+    let latestStatus: string | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let edits = Promise.resolve();
+    let finished = false;
+    const progress = (text: string): void => {
+      if (finished || this.disposed || job.controller.signal.aborted) return;
+      latestStatus = text;
+      if (timer !== undefined) return;
+      timer = setTimeout(() => {
+        timer = undefined;
+        edits = edits.then(async () => {
+          const handle = await handlePromise;
+          if (finished || this.disposed || job.controller.signal.aborted || handle === undefined || latestStatus === undefined) return;
+          const status = latestStatus;
+          latestStatus = undefined;
+          await adapter.editText(message.chatId, handle.messageId, `🎙 ${status.slice(0, 600)}`, keyboard);
+        }).catch(() => undefined);
+      }, PROGRESS_EDIT_INTERVAL_MS);
+    };
+    const finish = async (text: string): Promise<void> => {
+      finished = true;
+      if (timer !== undefined) clearTimeout(timer);
+      await edits;
+      if (this.disposed) return;
+      const handle = await handlePromise;
+      if (this.disposed) return;
+      if (handle !== undefined) {
+        try {
+          if (adapter.replaceText !== undefined) await adapter.replaceText(message.chatId, handle.messageId, text, []);
+          else if (text.length <= 3500) await adapter.editText(message.chatId, handle.messageId, text, []);
+          else {
+            await adapter.editText(message.chatId, handle.messageId, '🎙 Transcription complete.', []);
+            if (!this.disposed) await adapter.sendText(message.chatId, text);
+          }
+          return;
+        } catch { /* A deleted status message must not swallow the result. */ }
+      }
+      if (this.disposed) return;
+      try { await adapter.sendText(message.chatId, text); }
+      catch { this.ctx.logger.warn('messenger: could not deliver voice transcription status'); }
+    };
+    try {
+      // Submit synchronously before awaiting Telegram presentation to preserve arrival order.
+      const text = (await this.voice!.transcribe({
+        signal: job.controller.signal,
+        onProgress: progress,
+        loadAudio: async (signal) => {
+          if (!this.voiceTargetCurrent(job)) throw new Error('The selected session or question changed. Please resend the voice message.');
+          return adapter.downloadVoice!(message, signal);
+        },
+      })).trim();
+      if (job.controller.signal.aborted) throw job.controller.signal.reason;
+      if (!text) throw new Error('No speech recognized. Please try another recording.');
+      if (text.length > 32_000) throw new Error('The transcript is too long. Please send a shorter recording.');
+      await abortable(previous, job.controller.signal);
+      if (job.controller.signal.aborted) throw job.controller.signal.reason;
+      await finish(`🎙 Recognized:\n\n${text}`);
+      if (this.disposed) return;
+      await this.enqueueAction(job.key, async () => {
+        if (!this.voiceTargetCurrent(job)) {
+          await adapter.sendText(message.chatId, 'Transcript not sent: transcription was cancelled or the selected session/question changed. Send the text again if needed.');
+          return;
+        }
+        await this.handleUserText(adapter, { ...message, kind: 'message', text });
+      });
+    } catch (error) {
+      await finish(job.controller.signal.aborted
+        ? '🎙 Voice transcription cancelled.'
+        : `🎙 Could not transcribe: ${this.errorMessage(error).slice(0, 600)}`);
+    } finally {
+      finished = true;
+      if (timer !== undefined) clearTimeout(timer);
+      await edits;
+    }
+  }
+
   private async handleTextMessage(
     adapter: MessengerAdapter,
     message: InboundTextMessage,
   ): Promise<void> {
     const command = parseCommand(message.text);
+    if (command?.name === 'voice_cancel') {
+      const key = bindingKey(adapter.id, message.chatId, message.senderId);
+      const count = this.cancelVoice(key);
+      await adapter.sendText(message.chatId, count > 0
+        ? '🎙 Voice transcription cancelled.' : 'No pending voice transcriptions.');
+      return;
+    }
     if (command?.name === 'notifications') {
       await this.handleNotificationsCommand(adapter, message, command.argument);
       return;
@@ -655,6 +830,11 @@ export class MessengerBridge {
       return;
     }
 
+    await this.handleUserText(adapter, message);
+  }
+
+  /** Content only: transcripts must never pass through the command parser. */
+  private async handleUserText(adapter: MessengerAdapter, message: InboundTextMessage): Promise<void> {
     const key = bindingKey(message.transport, message.chatId, message.senderId);
     const pendingQuestion = this.pendingQuestions.get(key);
     if (pendingQuestion !== undefined) {
@@ -1118,6 +1298,8 @@ export class MessengerBridge {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    for (const job of this.voiceJobs.values()) job.controller.abort(new Error('Messenger bridge disposed.'));
+    const disposingVoice = this.voice?.dispose();
     for (const request of this.questionRequests.values()) {
       request.reject(new Error('messenger bridge disposed'));
     }
@@ -1131,6 +1313,8 @@ export class MessengerBridge {
     this.questionRetryDelays.clear();
     this.resolvingQuestions.clear();
     await Promise.allSettled([
+      disposingVoice,
+      ...[...this.voiceJobs.values()].map((job) => job.task),
       ...this.actionQueues.values(),
       ...this.outboundQueues.values(),
     ]);
@@ -1268,6 +1452,11 @@ export class MessengerBridge {
       throw new Error('This control is stale because the selected session changed.');
     }
     switch (action.kind) {
+      case 'voice-cancel': {
+        const count = this.cancelVoice(key, action.jobId);
+        await adapter.sendText(chatId, count > 0 ? '🎙 Voice transcription cancelled.' : 'This transcription has already finished.');
+        return;
+      }
       case 'menu':
         await this.showDashboard(adapter, chatId, senderId);
         return;

@@ -5,6 +5,7 @@ import { TelegramAdapter } from '../src/telegram.js';
 import { messengerBindingKey, type MessengerBindingRecord } from '../src/store.js';
 import {
   TELEGRAM_BOT_TOKEN_REF,
+  Config as MessengerConfigSchema,
   apply,
   inject,
   validateMessengerConfig,
@@ -136,6 +137,27 @@ describe('Messenger Host settings validation', () => {
 
   it('accepts the secure disabled defaults', () => {
     expect(() => validateMessengerConfig(config())).not.toThrow();
+  });
+
+  it('adds lazy voice defaults to existing settings and validates model/device enums', () => {
+    expect(MessengerConfigSchema({ telegram: {} } as unknown as Config).voice).toEqual({ enabled: true, model: 'small', device: 'auto' });
+    expect(() => MessengerConfigSchema({ telegram: {}, voice: { model: '../bad' } } as unknown as Config)).toThrow();
+    expect(() => MessengerConfigSchema({ telegram: {}, voice: { device: 'metal' } } as unknown as Config)).toThrow();
+  });
+
+  it('accepts per-host local voice choices and rejects unsafe configuration values', () => {
+    for (const model of ['tiny', 'base', 'small', 'medium', 'large-v3', 'turbo'] as const) {
+      for (const device of ['auto', 'cpu', 'cuda'] as const) {
+        expect(() => validateMessengerConfig({ ...config(), voice: { enabled: true, model, device } })).not.toThrow();
+      }
+    }
+    for (const voice of [
+      { enabled: true, model: '../custom-model', device: 'cpu' },
+      { enabled: true, model: 'small', device: 'shell' },
+      { enabled: 'yes', model: 'small', device: 'auto' },
+    ]) {
+      expect(() => validateMessengerConfig({ ...config(), voice } as Config)).toThrow('Whisper');
+    }
   });
 
   it('reserves the Telegram credential reference', () => {

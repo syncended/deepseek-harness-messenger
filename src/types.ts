@@ -21,6 +21,16 @@ export interface InboundTextMessage extends InboundMessengerBase {
   readonly kind: 'message';
 }
 
+export interface InboundVoiceMessage extends InboundMessengerBase {
+  readonly kind: 'voice';
+  readonly voice: {
+    readonly fileId: string;
+    readonly durationSeconds: number;
+    readonly sizeBytes?: number;
+    readonly mimeType?: string;
+  };
+}
+
 export interface InboundCallbackInteraction extends InboundMessengerBase {
   readonly kind: 'callback_query';
   readonly callbackQueryId: string;
@@ -29,6 +39,7 @@ export interface InboundCallbackInteraction extends InboundMessengerBase {
 
 export type InboundMessengerMessage =
   | InboundTextMessage
+  | InboundVoiceMessage
   | InboundCallbackInteraction;
 
 export interface MessengerMessageHandle {
@@ -98,6 +109,8 @@ export interface MessengerAdapter {
     showAlert?: boolean,
   ): Promise<void>;
   sendTyping(chatId: string): Promise<void>;
+  /** Download voice bytes only after the bridge authorizes the sender and chat. */
+  downloadVoice?(message: InboundVoiceMessage, signal: AbortSignal): Promise<Uint8Array>;
 }
 
 export interface ParsedCommand {
