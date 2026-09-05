@@ -2,16 +2,30 @@ import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import type {} from '@deepseek-ai/dsh-settings';
+import type {} from '@deepseek-ai/dsh-storage-domain';
 import type {} from '@deepseek-ai/dsh-user-questions';
 import type {} from '@deepseek-ai/dsh-workspace';
 import z from '@deepseek-ai/schemastery';
 import { MessengerBridge } from './bridge.js';
+import {
+  DurableMessengerBindingStore,
+  type MessengerBindingStore,
+} from './store.js';
 import { TelegramAdapter } from './telegram.js';
 import { installNotificationTool } from './notifications.js';
 import { openNotificationStore, type NotificationStore } from './notification-store.js';
 
 export { MessengerBridge, parseCommand } from './bridge.js';
 export { TelegramAdapter, TelegramApiError, splitTelegramText } from './telegram.js';
+export {
+  DurableMessengerBindingStore,
+  MemoryMessengerBindingStore,
+  messengerBindingDomainSpec,
+  messengerBindingIdentity,
+  messengerBindingKey,
+  messengerBindingRecordSchema,
+} from './store.js';
+export type { MessengerBindingRecord, MessengerBindingStore } from './store.js';
 export type {
   InboundMessengerMessage,
   MessengerAdapter,
@@ -90,6 +104,7 @@ async function startTelegramRuntime(
   ctx: Context,
   config: TelegramConfig,
   controller: AbortController,
+  bindingStore: MessengerBindingStore,
   beforeActivate: () => Promise<void>,
   notificationStore: NotificationStore,
 ): Promise<TelegramRuntime> {
@@ -152,21 +167,25 @@ async function startTelegramRuntime(
 
   try {
     await adapter.validate(controller.signal);
+    bridge = new MessengerBridge(ctx, {
+      allowedChatIds: config.allowedChatIds,
+      allowedUserIds: config.allowedUserIds,
+      privateChatsOnly: config.privateChatsOnly,
+      notificationStore,
+    }, bindingStore);
+    bridge.registerAdapter(adapter);
     await beforeActivate();
     if (controller.signal.aborted) throw controller.signal.reason;
+    // The previous runtime must drain mutations before taking the new snapshot.
+    await bridge.restoreBindings();
   } catch (error) {
     await stop();
     throw error;
   }
 
-  bridge = new MessengerBridge(ctx, {
-    allowedChatIds: config.allowedChatIds,
-    allowedUserIds: config.allowedUserIds,
-    privateChatsOnly: config.privateChatsOnly,
-    notificationStore,
-  });
-  bridge.registerAdapter(adapter);
-  disposeQuestionAnswerer = installQuestionAnswerer(ctx, bridge);
+  const readyBridge = bridge;
+  if (readyBridge === undefined) throw new Error('messenger: bridge initialization failed');
+  disposeQuestionAnswerer = installQuestionAnswerer(ctx, readyBridge);
 
   disposeSessionEvents = ctx.on('session/event', (session, event) => {
     if (!acceptingOutbound) return;
@@ -174,7 +193,7 @@ async function startTelegramRuntime(
     const previous = sessionEventTails.get(sessionId) ?? Promise.resolve();
     const task = previous
       .catch(() => undefined)
-      .then(() => bridge.onSessionEvent(sessionId, event));
+      .then(() => readyBridge.onSessionEvent(sessionId, event));
     sessionEventTails.set(sessionId, task);
     outbound.add(task);
     void task
@@ -192,7 +211,7 @@ async function startTelegramRuntime(
   polling = adapter
     .start(async (message) => {
       try {
-        await bridge.handle(message);
+        await readyBridge.handle(message);
       } catch (error) {
         if (!controller.signal.aborted) {
           ctx.logger.warn('messenger: Telegram message handling failed: %o', error);
@@ -239,42 +258,57 @@ export function validateMessengerConfig(config: Config): void {
   }
 }
 
+function telegramAccessPolicy(config: TelegramConfig): string {
+  return JSON.stringify({
+    allowedChatIds: [...new Set(config.allowedChatIds)].sort(),
+    allowedUserIds: [...new Set(config.allowedUserIds)].sort(),
+    privateChatsOnly: config.privateChatsOnly,
+  });
+}
+
 export async function apply(ctx: Context, entryConfig: Config): Promise<void> {
   let source = (): Config => entryConfig;
   let active: TelegramRuntime | undefined;
+  let activeAccessPolicy: string | undefined;
   let candidate: AbortController | undefined;
   let disposed = false;
   let generation = 0;
   let tail: Promise<void> = Promise.resolve();
-
-  const notificationStore = await openNotificationStore(ctx);
-  installNotificationTool(ctx, () => {
-    const bridge = disposed ? undefined : active?.bridge;
-    return bridge === undefined ? [] : [bridge];
-  });
+  const bindingStore = await DurableMessengerBindingStore.open(ctx);
 
   const reconcile = (): Promise<void> => {
     const requestedGeneration = ++generation;
     candidate?.abort(new Error('messenger configuration superseded'));
 
-    tail = tail.then(async () => {
+    const run = tail.then(async () => {
       if (disposed || requestedGeneration !== generation) return;
 
       const current = source();
       try {
         validateMessengerConfig(current);
       } catch (error) {
+        await active?.stop();
+        active = undefined;
+        activeAccessPolicy = undefined;
         ctx.logger.error('messenger: configuration is invalid: %o', error);
         return;
       }
       if (!current.telegram.enabled) {
         await active?.stop();
         active = undefined;
+        activeAccessPolicy = undefined;
         ctx.logger.info('messenger: Telegram adapter is disabled');
         return;
       }
 
-      const previous = active;
+      const requestedAccessPolicy = telegramAccessPolicy(current.telegram);
+      let previous = active;
+      if (previous !== undefined && activeAccessPolicy !== requestedAccessPolicy) {
+        await previous.stop();
+        if (active === previous) active = undefined;
+        activeAccessPolicy = undefined;
+        previous = undefined;
+      }
       const controller = new AbortController();
       candidate = controller;
       try {
@@ -282,6 +316,7 @@ export async function apply(ctx: Context, entryConfig: Config): Promise<void> {
           ctx,
           current.telegram,
           controller,
+          bindingStore,
           async () => {
             if (disposed || requestedGeneration !== generation) {
               controller.abort(new Error('messenger configuration superseded'));
@@ -297,6 +332,7 @@ export async function apply(ctx: Context, entryConfig: Config): Promise<void> {
           return;
         }
         active = next;
+        activeAccessPolicy = requestedAccessPolicy;
       } catch (error) {
         if (!controller.signal.aborted) {
           ctx.logger.error('messenger: Telegram adapter could not start: %o', error);
@@ -304,6 +340,9 @@ export async function apply(ctx: Context, entryConfig: Config): Promise<void> {
       } finally {
         if (candidate === controller) candidate = undefined;
       }
+    });
+    tail = run.catch((error: unknown) => {
+      ctx.logger.error('messenger: configuration reconciliation failed: %o', error);
     });
     return tail;
   };
@@ -313,12 +352,42 @@ export async function apply(ctx: Context, entryConfig: Config): Promise<void> {
       disposed = true;
       generation += 1;
       candidate?.abort(new Error('messenger plugin disposed'));
-      await tail;
-      await active?.stop();
+      const errors: unknown[] = [];
+      try {
+        await tail;
+      } catch (error) {
+        errors.push(error);
+      }
+      try {
+        await active?.stop();
+      } catch (error) {
+        errors.push(error);
+      }
       active = undefined;
+      activeAccessPolicy = undefined;
+      try {
+        await bindingStore.close();
+      } catch (error) {
+        errors.push(error);
+      }
+      if (errors.length > 0) {
+        throw new AggregateError(errors, 'messenger runtime disposal failed');
+      }
     },
     'messenger.runtime',
   );
+
+  let notificationStore: NotificationStore;
+  try {
+    notificationStore = await openNotificationStore(ctx);
+    installNotificationTool(ctx, () => {
+      const bridge = disposed ? undefined : active?.bridge;
+      return bridge === undefined ? [] : [bridge];
+    });
+  } catch (error) {
+    await bindingStore.close();
+    throw error;
+  }
 
   const settings = ctx.settings.register(
     MESSENGER_SETTINGS_NAMESPACE,

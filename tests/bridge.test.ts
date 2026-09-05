@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { MessengerBridge, parseCommand, type BridgeContext } from '../src/bridge.js';
 import { splitTelegramText } from '../src/telegram.js';
 import { NotificationStore, NOTIFICATION_LINK_TTL_MS } from '../src/notification-store.js';
+import { MemoryMessengerBindingStore } from '../src/store.js';
 import type {
   InboundCallbackInteraction,
   InboundTextMessage,
@@ -494,6 +495,162 @@ describe('persistent notification subscriptions', () => {
   });
 });
 
+describe('notification and per-user binding integration', () => {
+  async function setup() {
+    const context = fakeContext();
+    const original = (await context.sessions.list()).items[0]!;
+    context.sessions.list.mockResolvedValue({ items: [
+      original,
+      { ...original, sessionId: 'session-2' },
+      { ...original, sessionId: 'automation-run' },
+    ] });
+    let persisted: unknown = { subscriptions: [], links: [] };
+    const makeNotificationStore = () => new NotificationStore(persisted, async (state) => {
+      persisted = structuredClone(state);
+    });
+    const notificationStore = makeNotificationStore();
+    const bindingStore = new MemoryMessengerBindingStore();
+    const bridges: MessengerBridge[] = [];
+    const makeBridge = (
+      bindings = bindingStore,
+      notifications = notificationStore,
+      legacy = false,
+    ) => {
+      const adapter = new FakeAdapter();
+      const bridge = new MessengerBridge(context.ctx, {
+        allowedChatIds: ['100'],
+        allowedUserIds: ['alice', 'bob'],
+        privateChatsOnly: false,
+        ...(legacy ? {} : { notificationStore: notifications }),
+      }, bindings);
+      bridge.registerAdapter(adapter);
+      bridges.push(bridge);
+      return { bridge, adapter };
+    };
+    const inbound = (text: string, senderId = 'alice'): InboundTextMessage => ({
+      ...message(text), chatKind: 'group', senderId,
+    });
+    const click = (data: string, senderId = 'alice'): InboundCallbackInteraction => ({
+      ...callback(data, senderId), chatKind: 'group',
+    });
+    const cleanup = async () => {
+      await Promise.all(bridges.map((bridge) => bridge.dispose()));
+    };
+    return { ...context, bindingStore, notificationStore, makeNotificationStore,
+      makeBridge, inbound, click, cleanup };
+  }
+
+  it('opens a persisted notification only for its owner and restores that per-user selection', async () => {
+    const f = await setup();
+    try {
+      const first = f.makeBridge();
+      await first.bridge.handle(f.inbound('/resume session-1'));
+      await first.bridge.handle(f.inbound('/resume session-2', 'bob'));
+      await first.bridge.handle(f.inbound('/notifications on'));
+      const before = structuredClone(f.bindingStore.list());
+      expect(await first.bridge.notify('automation-run', 'Ready')).toEqual({ sent: 1, failed: 0, skipped: 0 });
+      const token = firstCallback(first.adapter);
+      expect(token).toMatch(/^n:/);
+      expect(f.bindingStore.list()).toEqual(before);
+      await first.bridge.dispose();
+
+      const bindings = new MemoryMessengerBindingStore(structuredClone(f.bindingStore.list()));
+      const restarted = f.makeBridge(bindings, f.makeNotificationStore());
+      await restarted.bridge.restoreBindings();
+      await restarted.bridge.handle(f.click(token, 'bob'));
+      expect(restarted.adapter.answers.at(-1)?.alert).toBe(true);
+      expect(bindings.list()).toEqual(before);
+      await restarted.bridge.handle(f.click(token));
+      expect(bindings.list().find((record) => record.senderId === 'alice')).toMatchObject({
+        transport: 'telegram', chatId: '100', chatKind: 'group',
+        authorizedAs: 'alice', sessionId: 'automation-run', sessionCwd: '/workspace/project',
+      });
+      expect(bindings.list().find((record) => record.senderId === 'bob')).toEqual(
+        before.find((record) => record.senderId === 'bob'),
+      );
+      await restarted.bridge.dispose();
+
+      const restored = f.makeBridge(
+        new MemoryMessengerBindingStore(structuredClone(bindings.list())),
+        f.makeNotificationStore(),
+      );
+      await restored.bridge.restoreBindings();
+      await restored.bridge.handle(f.inbound('Owner follow-up'));
+      expect(f.prompt).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId: 'automation-run' }), expect.anything());
+      await restored.bridge.handle(f.inbound('Other operator follow-up', 'bob'));
+      expect(f.prompt).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId: 'session-2' }), expect.anything());
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it('unbinds only the caller while preserving the chat subscription and persistent button', async () => {
+    const f = await setup();
+    try {
+      const { bridge, adapter } = f.makeBridge();
+      await bridge.handle(f.inbound('/resume session-1'));
+      await bridge.handle(f.inbound('/resume session-2', 'bob'));
+      await bridge.handle(f.inbound('/notifications on'));
+      await bridge.notify('automation-run', 'Before unbind');
+      const token = firstCallback(adapter);
+      const subscription = f.notificationStore.get('telegram', '100');
+      await bridge.handle(f.inbound('/unbind'));
+      expect(f.bindingStore.list().map(({ senderId, sessionId }) => ({ senderId, sessionId })))
+        .toEqual([{ senderId: 'bob', sessionId: 'session-2' }]);
+      expect(f.notificationStore.get('telegram', '100')).toEqual(subscription);
+      expect(f.notificationStore.link(token.slice(2))?.sessionId).toBe('automation-run');
+      expect(await bridge.notify('automation-run', 'Still subscribed')).toEqual({ sent: 1, failed: 0, skipped: 0 });
+      await bridge.handle(f.click(token));
+      expect(f.bindingStore.list().find((record) => record.senderId === 'alice')?.sessionId).toBe('automation-run');
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it('keeps the old durable and live selection when a notification binding save fails', async () => {
+    const f = await setup();
+    try {
+      const { bridge, adapter } = f.makeBridge();
+      await bridge.handle(f.inbound('/resume session-1'));
+      await bridge.handle(f.inbound('/resume session-2', 'bob'));
+      await bridge.handle(f.inbound('/notifications on'));
+      await bridge.notify('automation-run', 'Ready');
+      const token = firstCallback(adapter);
+      const before = structuredClone(f.bindingStore.list());
+      vi.spyOn(f.bindingStore, 'put').mockRejectedValueOnce(new Error('Disk full'));
+      await bridge.handle(f.click(token));
+      expect(adapter.sent.at(-1)?.text).toContain('Could not open');
+      expect(f.bindingStore.list()).toEqual(before);
+      expect(f.notificationStore.link(token.slice(2))?.sessionId).toBe('automation-run');
+      await bridge.handle(f.inbound('Still original'));
+      expect(f.prompt).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId: 'session-1' }), expect.anything());
+      await bridge.handle(f.inbound('Still independent', 'bob'));
+      expect(f.prompt).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId: 'session-2' }), expect.anything());
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it('deduplicates legacy notifications to one chat with multiple per-user bindings', async () => {
+    const f = await setup();
+    try {
+      const { bridge, adapter } = f.makeBridge(f.bindingStore, f.notificationStore, true);
+      await bridge.handle(f.inbound('/resume session-1'));
+      await bridge.handle(f.inbound('/resume session-1', 'bob'));
+      expect(f.bindingStore.list()).toHaveLength(2);
+      adapter.sent.length = 0;
+      expect(await bridge.notify('session-1', 'Legacy status')).toEqual({ sent: 1, failed: 0, skipped: 0 });
+      expect(adapter.sent).toEqual([{ chatId: '100', text: 'Legacy status' }]);
+      await bridge.handle(f.inbound('/unbind'));
+      adapter.sent.length = 0;
+      expect(await bridge.notify('session-1', 'Remaining operator')).toEqual({ sent: 1, failed: 0, skipped: 0 });
+      expect(adapter.sent).toEqual([{ chatId: '100', text: 'Remaining operator' }]);
+    } finally {
+      await f.cleanup();
+    }
+  });
+});
+
 describe('parseCommand', () => {
   it('parses commands without trusting Telegram bot suffixes', () => {
     expect(parseCommand(' /Use@my_bot  session-42 ')).toEqual({
@@ -526,6 +683,317 @@ describe('MessengerBridge controls', () => {
     expect(data).toMatch(/^m:[a-f0-9]{32}$/);
     expect(Buffer.byteLength(data)).toBeLessThanOrEqual(64);
     expect(data).not.toContain('session-1');
+  });
+
+  it('restores a per-user binding after bridge restart and keeps unbind durable', async () => {
+    const { ctx, prompt } = fakeContext();
+    const store = new MemoryMessengerBindingStore();
+    const options = {
+      allowedChatIds: ['100'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    };
+    const first = new MessengerBridge(ctx, options, store);
+    first.registerAdapter(new FakeAdapter());
+    await first.handle(message('/resume session-1'));
+    await first.dispose();
+
+    const secondAdapter = new FakeAdapter();
+    const second = new MessengerBridge(ctx, options, store);
+    second.registerAdapter(secondAdapter);
+    await second.restoreBindings();
+    await second.handle(message('continue after restart'));
+
+    expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'session-1',
+      content: [{ type: 'text', text: 'continue after restart' }],
+    }), expect.any(AbortSignal));
+
+    await second.handle(message('/unbind'));
+    await second.dispose();
+    const thirdAdapter = new FakeAdapter();
+    const third = new MessengerBridge(ctx, options, store);
+    third.registerAdapter(thirdAdapter);
+    await third.restoreBindings();
+    const promptsBefore = prompt.mock.calls.length;
+    await third.handle(message('must not be routed'));
+
+    expect(prompt).toHaveBeenCalledTimes(promptsBefore);
+    expect(thirdAdapter.sent.at(-1)?.text).toContain('No session selected');
+    await third.dispose();
+  });
+
+  it('isolates bindings by operator within a group and persists alias authorization', async () => {
+    const { ctx, prompt } = fakeContext();
+    const adapter = new FakeAdapter();
+    const store = new MemoryMessengerBindingStore();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: ['operator-login', 'other-login'],
+      privateChatsOnly: false,
+    }, store);
+    bridge.registerAdapter(adapter);
+
+    await bridge.handle({
+      ...message('/resume session-1'),
+      chatKind: 'group',
+      senderId: 'operator-uuid',
+      senderAliases: ['operator-uuid', 'operator-login'],
+    });
+    await bridge.handle({
+      ...message('other operator text'),
+      chatKind: 'group',
+      senderId: 'other-uuid',
+      senderAliases: ['other-uuid', 'other-login'],
+    });
+
+    expect(prompt).not.toHaveBeenCalled();
+    expect(adapter.sent.at(-1)?.text).toContain('No session selected');
+    expect(store.list()).toEqual([expect.objectContaining({
+      chatId: '100',
+      chatKind: 'group',
+      senderId: 'operator-uuid',
+      authorizedAs: 'operator-login',
+      sessionId: 'session-1',
+    })]);
+    await bridge.dispose();
+  });
+
+  it('prunes restored bindings revoked by policy or missing their session', async () => {
+    const { ctx } = fakeContext();
+    const store = new MemoryMessengerBindingStore([{
+      transport: 'telegram',
+      chatId: 'revoked-chat',
+      chatKind: 'private',
+      senderId: 'revoked-chat',
+      sessionId: 'session-1',
+      updatedAt: '2025-01-01T00:00:00.000Z',
+    }, {
+      transport: 'telegram',
+      chatId: '100',
+      chatKind: 'private',
+      senderId: '100',
+      sessionId: 'missing-session',
+      updatedAt: '2025-01-01T00:00:00.000Z',
+    }, {
+      transport: 'telegram',
+      chatId: '100',
+      chatKind: 'private',
+      senderId: 'other-lifecycle',
+      sessionId: 'session-1',
+      sessionCwd: '/replaced/session',
+      updatedAt: '2025-01-01T00:00:00.000Z',
+    }]);
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    }, store);
+    bridge.registerAdapter(new FakeAdapter());
+
+    await bridge.restoreBindings();
+
+    expect(store.list()).toEqual([]);
+    await bridge.dispose();
+  });
+
+  it('retains unavailable transport rows without intercepting questions', async () => {
+    const { ctx } = fakeContext();
+    const foreign = {
+      transport: 'discord',
+      chatId: '100',
+      chatKind: 'private' as const,
+      senderId: '100',
+      sessionId: 'session-1',
+      updatedAt: '2025-01-01T00:00:00.000Z',
+    };
+    const store = new MemoryMessengerBindingStore([foreign]);
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    }, store);
+    bridge.registerAdapter(new FakeAdapter());
+    await bridge.restoreBindings();
+
+    await expect(bridge.askQuestion('session-1', [{
+      id: 'foreign',
+      question: 'Must not be intercepted?',
+    }])).resolves.toBeUndefined();
+    expect(store.list()).toEqual([foreign]);
+    await bridge.dispose();
+  });
+
+  it('restores an allowlisted binding when an adapter omits chat kind', async () => {
+    const { ctx, prompt } = fakeContext();
+    const store = new MemoryMessengerBindingStore([{
+      transport: 'telegram',
+      chatId: '100',
+      senderId: 'operator',
+      sessionId: 'session-1',
+      updatedAt: '2025-01-01T00:00:00.000Z',
+    }]);
+    const adapter = new FakeAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: ['operator'],
+      privateChatsOnly: false,
+    }, store);
+    bridge.registerAdapter(adapter);
+    await bridge.restoreBindings();
+
+    await bridge.handle({
+      kind: 'message',
+      transport: 'telegram',
+      messageId: randomId(),
+      chatId: '100',
+      senderId: 'operator',
+      text: 'restored without kind',
+    });
+
+    expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'session-1',
+    }), expect.any(AbortSignal));
+    await bridge.dispose();
+  });
+
+  it('deduplicates passive output for users sharing one group session', async () => {
+    const { ctx } = fakeContext();
+    const adapter = new FakeAdapter();
+    const store = new MemoryMessengerBindingStore();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: ['one', 'two'],
+      privateChatsOnly: false,
+    }, store);
+    bridge.registerAdapter(adapter);
+    await bridge.handle({ ...message('/resume session-1'), chatKind: 'group', senderId: 'one' });
+    await bridge.handle({ ...message('/resume session-1'), chatKind: 'group', senderId: 'two' });
+    const sentBefore = adapter.sent.length;
+
+    await bridge.onSessionEvent('session-1', {
+      type: 'assistant/message',
+      seq: 1,
+      time: Date.now(),
+      surfaceOp: 'append',
+      data: {
+        message: { content: [{ type: 'text', text: 'One group delivery.' }] },
+      },
+    } as unknown as SessionEvent);
+
+    expect(adapter.sent.slice(sentBefore).filter(
+      (entry) => entry.text === 'One group delivery.',
+    )).toHaveLength(1);
+    await bridge.dispose();
+  });
+
+  it('shares one active progress message between group operators', async () => {
+    const { ctx, prompt } = fakeContext();
+    const adapter = new FakeAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: ['one', 'two'],
+      privateChatsOnly: false,
+    });
+    bridge.registerAdapter(adapter);
+    await bridge.handle({ ...message('/resume session-1'), chatKind: 'group', senderId: 'one' });
+    await bridge.handle({ ...message('/resume session-1'), chatKind: 'group', senderId: 'two' });
+    const sentBefore = adapter.sent.length;
+
+    await bridge.handle({ ...message('first queued turn'), chatKind: 'group', senderId: 'one' });
+    await bridge.handle({ ...message('second queued turn'), chatKind: 'group', senderId: 'two' });
+
+    expect(prompt).toHaveBeenCalledTimes(2);
+    expect(adapter.sent).toHaveLength(sentBefore + 1);
+    await bridge.dispose();
+  });
+
+  it('keeps shared progress alive when a second group prompt is rejected', async () => {
+    const { ctx, prompt } = fakeContext();
+    prompt.mockResolvedValueOnce({ accepted: true }).mockRejectedValueOnce(new Error('queue rejected'));
+    const adapter = new FakeAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: ['one', 'two'],
+      privateChatsOnly: false,
+    });
+    bridge.registerAdapter(adapter);
+    await bridge.handle({ ...message('/resume session-1'), chatKind: 'group', senderId: 'one' });
+    await bridge.handle({ ...message('/resume session-1'), chatKind: 'group', senderId: 'two' });
+
+    await bridge.handle({ ...message('accepted turn'), chatKind: 'group', senderId: 'one' });
+    await bridge.handle({ ...message('rejected turn'), chatKind: 'group', senderId: 'two' });
+    expect(adapter.sent.at(-1)?.text).toContain('Could not queue that prompt: queue rejected');
+    await bridge.onSessionEvent('session-1', {
+      type: 'assistant/message',
+      seq: 1,
+      time: Date.now(),
+      surfaceOp: 'append',
+      data: { message: { content: [{ type: 'text', text: 'Accepted result.' }] } },
+    } as unknown as SessionEvent);
+    await bridge.onSessionEvent('session-1', {
+      type: 'turn/end',
+      seq: 2,
+      time: Date.now(),
+      data: { turn: 1, reason: { kind: 'completed' } },
+    } as unknown as SessionEvent);
+
+    await vi.waitFor(() => expect(adapter.edits.at(-1)?.text).toBe('Accepted result.'));
+    await bridge.dispose();
+  });
+
+  it('keeps one group question and promotes it when its operator unbinds', async () => {
+    const { ctx } = fakeContext();
+    const adapter = new FakeAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: ['one', 'two'],
+      privateChatsOnly: false,
+    });
+    bridge.registerAdapter(adapter);
+    await bridge.handle({ ...message('/resume session-1'), chatKind: 'group', senderId: 'one' });
+    await bridge.onQuestionRequested('group-question', 'session-1', [{
+      id: 'confirm',
+      question: 'Only one visible copy?',
+      options: [{ label: 'Yes' }],
+    }]);
+    expect(adapter.sent.filter((entry) => entry.text.includes('Only one visible copy?'))).toHaveLength(1);
+
+    await bridge.handle({ ...message('/resume session-1'), chatKind: 'group', senderId: 'two' });
+    expect(adapter.sent.filter((entry) => entry.text.includes('Only one visible copy?'))).toHaveLength(1);
+
+    await bridge.handle({ ...message('/unbind'), chatKind: 'group', senderId: 'one' });
+    expect(adapter.sent.filter((entry) => entry.text.includes('Only one visible copy?'))).toHaveLength(2);
+    await bridge.dispose();
+  });
+
+  it('does not retry a failed group question after another operator displays it', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ctx } = fakeContext();
+      const adapter = new FakeAdapter();
+      const bridge = new MessengerBridge(ctx, {
+        allowedChatIds: ['100'],
+        allowedUserIds: ['one', 'two'],
+        privateChatsOnly: false,
+      });
+      bridge.registerAdapter(adapter);
+      await bridge.handle({ ...message('/resume session-1'), chatKind: 'group', senderId: 'one' });
+      vi.spyOn(adapter, 'sendText').mockRejectedValueOnce(new Error('temporary transport error'));
+      await bridge.onQuestionRequested('retry-question', 'session-1', [{
+        id: 'retry',
+        question: 'Retry only once?',
+        options: [{ label: 'Yes' }],
+      }]);
+
+      await bridge.handle({ ...message('/resume session-1'), chatKind: 'group', senderId: 'two' });
+      await vi.advanceTimersByTimeAsync(600);
+
+      expect(adapter.sent.filter((entry) => entry.text.includes('Retry only once?'))).toHaveLength(1);
+      await bridge.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('chooses a registered workspace before creating a session', async () => {
@@ -571,6 +1039,48 @@ describe('MessengerBridge controls', () => {
     expect(adapter.sent.at(-1)?.text).toContain('No registered workspaces');
     await bridge.handle(callback(callbackFor(adapter, 'Host default')));
     expect(sessions.create).toHaveBeenCalledWith({});
+  });
+
+  it('reports recovery instructions when a new session binding cannot be saved', async () => {
+    const { ctx, sessions } = fakeContext();
+    const adapter = new FakeAdapter();
+    const store = new MemoryMessengerBindingStore();
+    vi.spyOn(store, 'put').mockRejectedValueOnce(new Error('storage full'));
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    }, store);
+    bridge.registerAdapter(adapter);
+    await bridge.handle(message('/new'));
+
+    await bridge.handle(callback(callbackFor(adapter, 'Host default')));
+
+    expect(sessions.create).toHaveBeenCalledOnce();
+    expect(store.list()).toEqual([]);
+    expect(adapter.sent.at(-1)?.text).toContain('was created, but its messenger binding could not be saved');
+    expect(adapter.sent.at(-1)?.text).toContain('/sessions');
+    await bridge.dispose();
+  });
+
+  it('reports the created session when its post-create catalog lookup fails', async () => {
+    const { ctx, sessions } = fakeContext();
+    const adapter = new FakeAdapter();
+    const bridge = new MessengerBridge(ctx, {
+      allowedChatIds: ['100'],
+      allowedUserIds: [],
+      privateChatsOnly: true,
+    });
+    bridge.registerAdapter(adapter);
+    await bridge.handle(message('/new'));
+    sessions.list.mockRejectedValueOnce(new Error('catalog unavailable'));
+
+    await bridge.handle(callback(callbackFor(adapter, 'Host default')));
+
+    expect(sessions.create).toHaveBeenCalledOnce();
+    expect(adapter.sent.at(-1)?.text).toContain('was created, but its messenger binding could not be saved');
+    expect(adapter.sent.at(-1)?.text).toContain('/sessions');
+    await bridge.dispose();
   });
 
   it('answers callbacks before resuming and rejects a replay', async () => {

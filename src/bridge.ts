@@ -12,11 +12,19 @@ import type { SessionController } from '@deepseek-ai/dsh-api-session-controller'
 import { DshControl, sessionTitle, visibleAssistantText } from './control.js';
 import { splitTelegramText } from './telegram.js';
 import type { NotificationStore, Subscription } from './notification-store.js';
+import {
+  MemoryMessengerBindingStore,
+  messengerBindingIdentity,
+  messengerBindingKey,
+  type MessengerBindingRecord,
+  type MessengerBindingStore,
+} from './store.js';
 import type {
   InboundCallbackInteraction,
   InboundMessengerMessage,
   InboundTextMessage,
   MessengerAdapter,
+  MessengerChatKind,
   MessengerInlineKeyboard,
   MessengerMessageHandle,
   ParsedCommand,
@@ -180,8 +188,18 @@ export function parseCommand(text: string): ParsedCommand | undefined {
   };
 }
 
-function bindingKey(transport: string, chatId: string): string {
-  return `${transport}:${chatId}`;
+function bindingKey(transport: string, chatId: string, senderId: string): string {
+  return messengerBindingKey(transport, chatId, senderId);
+}
+
+const bindingIdentity = messengerBindingIdentity;
+
+function bindingDestinationKey(transport: string, chatId: string): string {
+  return JSON.stringify([transport, chatId]);
+}
+
+function progressKey(transport: string, chatId: string, sessionId: string): string {
+  return JSON.stringify([transport, chatId, sessionId]);
 }
 
 function shortId(sessionId: string): string {
@@ -491,7 +509,7 @@ export class MessengerBridge {
   private readonly allowedUserIds: ReadonlySet<string>;
   private readonly privateChatsOnly: boolean;
   private readonly bindings = new Map<string, string>();
-  private readonly bindingOperators = new Map<string, string>();
+  private readonly bindingUpdatedAt = new Map<string, string>();
   private readonly bindingRevisions = new Map<string, number>();
   private readonly adapters = new Map<string, MessengerAdapter>();
   private readonly outboundQueues = new Map<string, Promise<unknown>>();
@@ -511,12 +529,67 @@ export class MessengerBridge {
   constructor(
     private readonly ctx: BridgeContext,
     options: MessengerBridgeOptions,
+    private readonly bindingStore: MessengerBindingStore = new MemoryMessengerBindingStore(),
   ) {
     this.allowedChatIds = new Set(options.allowedChatIds);
     this.allowedUserIds = new Set(options.allowedUserIds);
     this.privateChatsOnly = options.privateChatsOnly;
     this.control = new DshControl(ctx);
     this.notificationStore = options.notificationStore;
+  }
+
+  async restoreBindings(): Promise<void> {
+    const sessions = new Map(
+      (await this.control.listSessions()).map((session) => [
+        String(session.sessionId),
+        session,
+      ]),
+    );
+    this.bindings.clear();
+    this.bindingUpdatedAt.clear();
+    this.bindingRevisions.clear();
+
+    for (const record of this.bindingStore.list()) {
+      if (!this.adapters.has(record.transport)) continue;
+      if (!this.authorizedBinding(record)) {
+        try {
+          await this.bindingStore.delete(
+            record.transport,
+            record.chatId,
+            record.senderId,
+          );
+        } catch (error) {
+          this.ctx.logger.warn(
+            'messenger: failed to remove a revoked persisted binding: %o',
+            error,
+          );
+        }
+        continue;
+      }
+      const session = sessions.get(record.sessionId);
+      if (
+        session === undefined
+        || (record.sessionCwd !== undefined && record.sessionCwd !== session.cwd)
+      ) {
+        try {
+          await this.bindingStore.delete(
+            record.transport,
+            record.chatId,
+            record.senderId,
+          );
+        } catch (error) {
+          this.ctx.logger.warn(
+            'messenger: failed to remove a stale persisted binding: %o',
+            error,
+          );
+        }
+        continue;
+      }
+      const key = bindingKey(record.transport, record.chatId, record.senderId);
+      this.bindings.set(key, record.sessionId);
+      this.bindingUpdatedAt.set(key, record.updatedAt);
+      this.bindingRevisions.set(key, 1);
+    }
   }
 
   registerAdapter(adapter: MessengerAdapter): void {
@@ -549,7 +622,7 @@ export class MessengerBridge {
       return;
     }
 
-    const key = bindingKey(adapter.id, message.chatId);
+    const key = bindingKey(adapter.id, message.chatId, message.senderId);
     if (parseCommand(message.text) === undefined && !this.bindings.has(key)) {
       await adapter.sendText(
         message.chatId,
@@ -571,11 +644,18 @@ export class MessengerBridge {
       return;
     }
     if (command !== undefined) {
-      await this.handleCommand(adapter, message.chatId, message.senderId, command);
+      await this.handleCommand(
+        adapter,
+        message.chatId,
+        message.chatKind,
+        message.senderId,
+        this.authorizationIdentity(message),
+        command,
+      );
       return;
     }
 
-    const key = bindingKey(message.transport, message.chatId);
+    const key = bindingKey(message.transport, message.chatId, message.senderId);
     const pendingQuestion = this.pendingQuestions.get(key);
     if (pendingQuestion !== undefined) {
       try {
@@ -599,6 +679,9 @@ export class MessengerBridge {
       return;
     }
 
+    const sharedProgressAlreadyActive = this.progress.has(
+      progressKey(adapter.id, message.chatId, sessionId),
+    );
     void this.beginProgress(adapter, message.chatId, message.senderId, sessionId)
       .catch((error: unknown) => {
         this.ctx.logger.warn(
@@ -609,7 +692,20 @@ export class MessengerBridge {
     try {
       await this.control.prompt(sessionId, message.text, 'queue');
     } catch (error) {
-      await this.failProgress(adapter, message.chatId, sessionId, error);
+      if (sharedProgressAlreadyActive) {
+        await adapter.sendText(
+          message.chatId,
+          `Could not queue that prompt: ${this.errorMessage(error)}`,
+        );
+      } else {
+        await this.failProgress(
+          adapter,
+          message.chatId,
+          message.senderId,
+          sessionId,
+          error,
+        );
+      }
     }
   }
 
@@ -780,7 +876,7 @@ export class MessengerBridge {
     const recipients = this.notificationRecipients();
     if (recipients.length === 0) throw new Error('No notification subscribers. Send /notifications on in an allowed bot chat first.');
     const sends = recipients.map((subscription) => this.enqueueOutbound(
-      bindingKey(subscription.transport, subscription.chatId),
+      bindingDestinationKey(subscription.transport, subscription.chatId),
       async () => {
         const current = () => !this.disposed && !signal?.aborted
           && store.get(subscription.transport, subscription.chatId)?.id === subscription.id;
@@ -815,10 +911,8 @@ export class MessengerBridge {
     signal?.throwIfAborted();
     if (this.notificationStore !== undefined) return this.notifySubscribers(sessionId, text, signal);
     const sends: Promise<boolean>[] = [];
-    for (const [key, boundSessionId] of this.bindings) {
-      if (boundSessionId !== sessionId) continue;
-      const separator = key.indexOf(':');
-      const adapter = this.adapters.get(key.slice(0, separator));
+    for (const { key, transport, chatId } of this.bindingRecipients(sessionId)) {
+      const adapter = this.adapters.get(transport);
       if (adapter === undefined) continue;
       const revision = this.bindingRevisions.get(key);
       sends.push(this.enqueueOutbound(key, async () => {
@@ -826,7 +920,7 @@ export class MessengerBridge {
         if (this.disposed || signal?.aborted
           || this.bindings.get(key) !== sessionId
           || this.bindingRevisions.get(key) !== revision) return false;
-        await adapter.sendText(key.slice(separator + 1), adapter.renderText?.(text) ?? text);
+        await adapter.sendText(chatId, adapter.renderText?.(text) ?? text);
         return true;
       }));
     }
@@ -917,10 +1011,25 @@ export class MessengerBridge {
       });
     }
 
+    await this.promotePendingQuestion(request);
+  }
+
+  private async promotePendingQuestion(
+    request: PendingQuestionRequest,
+    inlineKey?: string,
+  ): Promise<void> {
+    const occupiedDestinations = new Set(
+      [...this.pendingQuestions.values()]
+        .filter((state) => state.sessionId === request.sessionId)
+        .map((state) => bindingDestinationKey(state.adapter.id, state.chatId)),
+    );
     const starts: Promise<unknown>[] = [];
-    for (const [key, boundSessionId] of this.bindings) {
-      if (boundSessionId !== sessionId) continue;
-      starts.push(this.enqueueAction(key, () => this.startQuestionForBinding(key, request)));
+    for (const { key, transport, chatId } of this.bindingRecipients(request.sessionId)) {
+      const destination = bindingDestinationKey(transport, chatId);
+      if (occupiedDestinations.has(destination)) continue;
+      occupiedDestinations.add(destination);
+      const start = (): Promise<void> => this.startQuestionForBinding(key, request);
+      starts.push(key === inlineKey ? start() : this.enqueueAction(key, start));
     }
     const started = await Promise.allSettled(starts);
     for (const result of started) {
@@ -955,6 +1064,7 @@ export class MessengerBridge {
     rpcId: string,
     outcome: 'answered' | 'cancelled',
     resolvedText: string,
+    inlineKey?: string,
   ): Promise<boolean> {
     const request = this.questionRequests.get(rpcId);
     const resolvedStates: PendingQuestionState[] = [];
@@ -996,17 +1106,11 @@ export class MessengerBridge {
       this.scheduleProgressEdits(progress);
     }
 
-    const promotions = resolvedStates.map(async (state) => {
+    if (sessionId !== undefined) {
       const next = [...this.questionRequests.values()].find(
-        (candidate) => candidate.sessionId === state.sessionId,
+        (candidate) => candidate.sessionId === sessionId,
       );
-      if (next !== undefined) await this.startQuestionForBinding(state.key, next);
-    });
-    const promoted = await Promise.allSettled(promotions);
-    for (const result of promoted) {
-      if (result.status === 'rejected') {
-        this.ctx.logger.warn('messenger: failed to show queued user question: %o', result.reason);
-      }
+      if (next !== undefined) await this.promotePendingQuestion(next, inlineKey);
     }
     return true;
   }
@@ -1059,15 +1163,31 @@ export class MessengerBridge {
     } catch (error) {
       this.ctx.logger.warn('messenger: failed to acknowledge notification button: %o', error);
     }
-    await this.enqueueAction(bindingKey(adapter.id, message.chatId), async () => {
+    await this.enqueueAction(bindingKey(adapter.id, message.chatId, message.senderId), async () => {
       if (!valid()) return;
       try {
-        await this.bindSession(adapter, message.chatId, message.senderId, link.sessionId, valid);
+        await this.bindSession(adapter, message.chatId, message.chatKind, message.senderId,
+          this.authorizationIdentity(message), link.sessionId, valid);
       } catch (error) {
         this.ctx.logger.warn('messenger: could not open notification session: %o', error);
         await adapter.sendText(message.chatId, 'Could not open the notification session. It may have been deleted or the subscription changed. Use /resume to choose another session.');
       }
     });
+  }
+
+  private authorizedBinding(record: MessengerBindingRecord): boolean {
+    if (!this.allowedChatIds.has(record.chatId)) return false;
+    if (record.chatKind === 'private') return true;
+    return !this.privateChatsOnly
+      && this.allowedUserIds.has(record.authorizedAs ?? record.senderId);
+  }
+
+  private authorizationIdentity(
+    message: InboundMessengerMessage,
+  ): string | undefined {
+    if (message.chatKind === 'private') return undefined;
+    const senderIds = message.senderAliases ?? [message.senderId];
+    return senderIds.find((id) => this.allowedUserIds.has(id));
   }
 
   private async handleCallback(
@@ -1093,7 +1213,7 @@ export class MessengerBridge {
       await adapter.answerCallback(message.callbackQueryId, 'This control belongs to another operator.', true);
       return;
     }
-    const key = bindingKey(adapter.id, message.chatId);
+    const key = bindingKey(adapter.id, message.chatId, message.senderId);
     const target = actionSessionId(record.action);
     if (target !== undefined && (
       this.bindings.get(key) !== target
@@ -1110,12 +1230,14 @@ export class MessengerBridge {
     } catch (error) {
       this.ctx.logger.warn('messenger: failed to answer claimed callback: %o', error);
     }
-    await this.enqueueAction(bindingKey(adapter.id, message.chatId), async () => {
+    await this.enqueueAction(key, async () => {
       try {
         await this.runAction(
           adapter,
           message.chatId,
+          message.chatKind,
           message.senderId,
+          this.authorizationIdentity(message),
           record.action,
           record.bindingRevision,
         );
@@ -1131,12 +1253,14 @@ export class MessengerBridge {
   private async runAction(
     adapter: MessengerAdapter,
     chatId: string,
+    chatKind: MessengerChatKind | undefined,
     senderId: string,
+    authorizedAs: string | undefined,
     action: CallbackAction,
     expectedBindingRevision: number,
   ): Promise<void> {
     const target = actionSessionId(action);
-    const key = bindingKey(adapter.id, chatId);
+    const key = bindingKey(adapter.id, chatId, senderId);
     if (target !== undefined && (
       this.bindings.get(key) !== target
       || (this.bindingRevisions.get(key) ?? 0) !== expectedBindingRevision
@@ -1151,7 +1275,14 @@ export class MessengerBridge {
         await this.showSessions(adapter, chatId, senderId, action.page);
         return;
       case 'bind':
-        await this.bindSession(adapter, chatId, senderId, action.sessionId);
+        await this.bindSession(
+          adapter,
+          chatId,
+          chatKind,
+          senderId,
+          authorizedAs,
+          action.sessionId,
+        );
         return;
       case 'new':
         await this.showWorkspaces(adapter, chatId, senderId, 0);
@@ -1160,7 +1291,14 @@ export class MessengerBridge {
         await this.showWorkspaces(adapter, chatId, senderId, action.page);
         return;
       case 'create':
-        await this.createSession(adapter, chatId, senderId, action.workspaceId);
+        await this.createSession(
+          adapter,
+          chatId,
+          chatKind,
+          senderId,
+          authorizedAs,
+          action.workspaceId,
+        );
         return;
       case 'models':
         await this.showModels(adapter, chatId, senderId, action.sessionId);
@@ -1228,7 +1366,9 @@ export class MessengerBridge {
   private async handleCommand(
     adapter: MessengerAdapter,
     chatId: string,
+    chatKind: MessengerChatKind | undefined,
     senderId: string,
+    authorizedAs: string | undefined,
     command: ParsedCommand,
   ): Promise<void> {
     try {
@@ -1249,7 +1389,14 @@ export class MessengerBridge {
         case 'resume':
         case 'use':
           if (command.argument) {
-            await this.bindSession(adapter, chatId, senderId, command.argument);
+            await this.bindSession(
+              adapter,
+              chatId,
+              chatKind,
+              senderId,
+              authorizedAs,
+              command.argument,
+            );
           } else {
             await this.showSessions(adapter, chatId, senderId, 0);
           }
@@ -1270,14 +1417,22 @@ export class MessengerBridge {
           await this.showContext(adapter, chatId, senderId);
           return;
         case 'unbind': {
-          const key = bindingKey(adapter.id, chatId);
+          const key = bindingKey(adapter.id, chatId, senderId);
+          const previousSessionId = this.bindings.get(key);
+          await this.bindingStore.delete(adapter.id, chatId, senderId);
           this.bindings.delete(key);
-          this.bindingOperators.delete(key);
+          this.bindingUpdatedAt.delete(key);
           const pending = this.pendingQuestions.get(key);
           if (pending !== undefined) this.clearQuestionCallbacks(pending);
           this.pendingQuestions.delete(key);
           this.clearQuestionRetry(key);
           this.bindingRevisions.set(key, (this.bindingRevisions.get(key) ?? 0) + 1);
+          if (previousSessionId !== undefined) {
+            const request = [...this.questionRequests.values()].find(
+              (candidate) => candidate.sessionId === previousSessionId,
+            );
+            if (request !== undefined) await this.promotePendingQuestion(request);
+          }
           await adapter.sendText(chatId, 'Binding removed.', {
             keyboard: this.mainKeyboard(adapter.id, chatId, senderId),
           });
@@ -1287,7 +1442,7 @@ export class MessengerBridge {
           await this.cancel(adapter, chatId, senderId);
           return;
         case 'steer': {
-          const sessionId = this.binding(adapter.id, chatId);
+          const sessionId = this.binding(adapter.id, chatId, senderId);
           if (command.argument.length === 0) {
             await adapter.sendText(chatId, 'Usage: /steer <text>');
             return;
@@ -1312,16 +1467,15 @@ export class MessengerBridge {
     if (existing !== undefined) return;
     const rpcId = String(request.rpcId);
     if (this.questionRequests.get(rpcId) !== request || this.resolvingQuestions.has(rpcId)) return;
-    const separator = key.indexOf(':');
-    const adapter = this.adapters.get(key.slice(0, separator));
-    const chatId = key.slice(separator + 1);
+    const { transport, chatId, senderId } = bindingIdentity(key);
+    const adapter = this.adapters.get(transport);
     if (adapter === undefined || this.bindings.get(key) !== request.sessionId) return;
     const state: PendingQuestionState = {
       ...request,
       key,
       adapter,
       chatId,
-      senderId: this.bindingOperators.get(key) ?? chatId,
+      senderId,
       index: 0,
       answers: [],
       selected: new Set(),
@@ -1355,10 +1509,20 @@ export class MessengerBridge {
     const delayMs = this.questionRetryDelays.get(key) ?? 500;
     const timer = setTimeout(() => {
       this.questionRetries.delete(key);
+      const { transport, chatId } = bindingIdentity(key);
+      const destination = bindingDestinationKey(transport, chatId);
+      const destinationOccupied = [...this.pendingQuestions.values()].some(
+        (state) => state.sessionId === request.sessionId
+          && bindingDestinationKey(state.adapter.id, state.chatId) === destination,
+      );
+      const stillSelected = this.bindingRecipients(request.sessionId).some(
+        (recipient) => recipient.key === key,
+      );
       if (
         this.disposed
         || this.questionRequests.get(rpcId) !== request
-        || this.pendingQuestions.has(key)
+        || destinationOccupied
+        || !stillSelected
         || this.bindings.get(key) !== request.sessionId
       ) {
         this.questionRetryDelays.delete(key);
@@ -1598,6 +1762,7 @@ export class MessengerBridge {
       String(state.rpcId),
       'answered',
       accepted ? '✅ Answer submitted.' : '✅ Answered elsewhere.',
+      state.key,
     );
     if (!settled && state.handle !== undefined) {
       await state.adapter.editText(
@@ -1626,7 +1791,7 @@ export class MessengerBridge {
     }
     const pages = Math.ceil(sessions.length / SESSION_PAGE_SIZE);
     const page = Math.max(0, Math.min(requestedPage, pages - 1));
-    const selected = this.bindings.get(bindingKey(adapter.id, chatId));
+    const selected = this.bindings.get(bindingKey(adapter.id, chatId, senderId));
     const rows = sessions
       .slice(page * SESSION_PAGE_SIZE, (page + 1) * SESSION_PAGE_SIZE)
       .map((session) => [this.button(
@@ -1652,30 +1817,60 @@ export class MessengerBridge {
   private async bindSession(
     adapter: MessengerAdapter,
     chatId: string,
+    chatKind: MessengerChatKind | undefined,
     senderId: string,
+    authorizedAs: string | undefined,
     sessionId: string,
     stillValid: () => boolean = () => true,
   ): Promise<void> {
     const sessions = await this.control.listSessions();
-    if (!sessions.some((session) => String(session.sessionId) === sessionId)) {
-      throw new Error(`Session ${sessionId} was not found.`);
-    }
+    const summary = sessions.find((session) => String(session.sessionId) === sessionId);
+    if (summary === undefined) throw new Error(`Session ${sessionId} was not found.`);
     // Reading the model directory uses the canonical resume path for dormant sessions.
     await this.control.models(sessionId);
     if (this.disposed || !stillValid()) throw new Error('This session control is no longer active.');
-    const key = bindingKey(adapter.id, chatId);
+    const key = bindingKey(adapter.id, chatId, senderId);
+    const previousSessionId = this.bindings.get(key);
+    const previousRecord = this.bindingStore.list().find((record) =>
+      record.transport === adapter.id && record.chatId === chatId && record.senderId === senderId);
+    const updatedAt = new Date().toISOString();
+    await this.bindingStore.put({
+      transport: adapter.id,
+      chatId,
+      ...(chatKind === undefined ? {} : { chatKind }),
+      senderId,
+      ...(authorizedAs === undefined ? {} : { authorizedAs }),
+      sessionId,
+      ...(summary.cwd === undefined ? {} : { sessionCwd: summary.cwd }),
+      updatedAt,
+    });
+    if (!stillValid()) {
+      if (previousRecord !== undefined) await this.bindingStore.put(previousRecord);
+      else await this.bindingStore.delete(adapter.id, chatId, senderId);
+      throw new Error('This session control is no longer active.');
+    }
+    // An accepted write remains durable across shutdown; do not restart UI work.
+    if (this.disposed) return;
     const previousQuestion = this.pendingQuestions.get(key);
     if (previousQuestion !== undefined) this.clearQuestionCallbacks(previousQuestion);
     this.pendingQuestions.delete(key);
     this.clearQuestionRetry(key);
     this.bindings.set(key, sessionId);
-    this.bindingOperators.set(key, senderId);
+    this.bindingUpdatedAt.set(key, updatedAt);
     this.bindingRevisions.set(key, (this.bindingRevisions.get(key) ?? 0) + 1);
+    if (previousSessionId !== undefined && previousSessionId !== sessionId) {
+      const previousRequest = [...this.questionRequests.values()].find(
+        (request) => request.sessionId === previousSessionId,
+      );
+      if (previousRequest !== undefined) {
+        await this.promotePendingQuestion(previousRequest);
+      }
+    }
     await this.showDashboard(adapter, chatId, senderId);
     const pending = [...this.questionRequests.values()].find(
       (request) => request.sessionId === sessionId,
     );
-    if (pending !== undefined) await this.startQuestionForBinding(key, pending);
+    if (pending !== undefined) await this.promotePendingQuestion(pending, key);
   }
 
   private async showWorkspaces(
@@ -1732,17 +1927,57 @@ export class MessengerBridge {
   private async createSession(
     adapter: MessengerAdapter,
     chatId: string,
+    chatKind: MessengerChatKind | undefined,
     senderId: string,
+    authorizedAs: string | undefined,
     workspaceId?: WorkspaceId,
   ): Promise<void> {
     await adapter.sendTyping(chatId);
     const sessionId = await this.control.createSession(workspaceId);
-    const key = bindingKey(adapter.id, chatId);
+    const key = bindingKey(adapter.id, chatId, senderId);
+    const previousSessionId = this.bindings.get(key);
+    const updatedAt = new Date().toISOString();
+    try {
+      const summary = (await this.control.listSessions()).find(
+        (session) => String(session.sessionId) === sessionId,
+      );
+      await this.bindingStore.put({
+        transport: adapter.id,
+        chatId,
+        ...(chatKind === undefined ? {} : { chatKind }),
+        senderId,
+        ...(authorizedAs === undefined ? {} : { authorizedAs }),
+        sessionId,
+        ...(summary?.cwd === undefined ? {} : { sessionCwd: summary.cwd }),
+        updatedAt,
+      });
+    } catch (error) {
+      throw new Error(
+        `Session ${shortId(sessionId)} was created, but its messenger binding could not be saved. Open /sessions to bind it before retrying /new.`,
+        { cause: error },
+      );
+    }
+    const previousQuestion = this.pendingQuestions.get(key);
+    if (previousQuestion !== undefined) this.clearQuestionCallbacks(previousQuestion);
+    this.pendingQuestions.delete(key);
+    this.clearQuestionRetry(key);
     this.bindings.set(key, sessionId);
-    this.bindingOperators.set(key, senderId);
+    this.bindingUpdatedAt.set(key, updatedAt);
     this.bindingRevisions.set(key, (this.bindingRevisions.get(key) ?? 0) + 1);
+    if (previousSessionId !== undefined && previousSessionId !== sessionId) {
+      const previousRequest = [...this.questionRequests.values()].find(
+        (request) => request.sessionId === previousSessionId,
+      );
+      if (previousRequest !== undefined) {
+        await this.promotePendingQuestion(previousRequest);
+      }
+    }
     await adapter.sendText(chatId, `Created ${shortId(sessionId)}.`);
     await this.showDashboard(adapter, chatId, senderId);
+    const pending = [...this.questionRequests.values()].find(
+      (request) => request.sessionId === sessionId,
+    );
+    if (pending !== undefined) await this.promotePendingQuestion(pending, key);
   }
 
   private async showDashboard(
@@ -1750,7 +1985,7 @@ export class MessengerBridge {
     chatId: string,
     senderId: string,
   ): Promise<void> {
-    const sessionId = this.bindings.get(bindingKey(adapter.id, chatId));
+    const sessionId = this.bindings.get(bindingKey(adapter.id, chatId, senderId));
     if (sessionId === undefined) {
       await adapter.sendText(
         chatId,
@@ -1801,7 +2036,7 @@ export class MessengerBridge {
     adapter: MessengerAdapter,
     chatId: string,
     senderId: string,
-    sessionId = this.binding(adapter.id, chatId),
+    sessionId = this.binding(adapter.id, chatId, senderId),
   ): Promise<void> {
     const directory = await this.control.models(sessionId);
     const rows = directory.groups.map((group) => [this.button(
@@ -1885,7 +2120,7 @@ export class MessengerBridge {
     adapter: MessengerAdapter,
     chatId: string,
     senderId: string,
-    sessionId = this.binding(adapter.id, chatId),
+    sessionId = this.binding(adapter.id, chatId, senderId),
   ): Promise<void> {
     const directory = await this.control.models(sessionId);
     const group = directory.groups.find((candidate) => candidate.id === directory.current.provider);
@@ -1960,7 +2195,7 @@ export class MessengerBridge {
     adapter: MessengerAdapter,
     chatId: string,
     senderId: string,
-    sessionId = this.binding(adapter.id, chatId),
+    sessionId = this.binding(adapter.id, chatId, senderId),
   ): Promise<void> {
     const permission = await this.control.permission(sessionId);
     const rows = permission.options.map((option) => [this.button(
@@ -1992,7 +2227,7 @@ export class MessengerBridge {
     adapter: MessengerAdapter,
     chatId: string,
     senderId: string,
-    sessionId = this.binding(adapter.id, chatId),
+    sessionId = this.binding(adapter.id, chatId, senderId),
   ): Promise<void> {
     const snapshot = await this.control.snapshot(sessionId);
     const context = snapshot.context;
@@ -2023,7 +2258,7 @@ export class MessengerBridge {
     adapter: MessengerAdapter,
     chatId: string,
     senderId: string,
-    sessionId = this.binding(adapter.id, chatId),
+    sessionId = this.binding(adapter.id, chatId, senderId),
   ): Promise<void> {
     const cancelled = await this.control.cancel(sessionId);
     await adapter.sendText(
@@ -2054,7 +2289,7 @@ export class MessengerBridge {
       transport,
       chatId,
       senderId,
-      bindingRevision: this.bindingRevisions.get(bindingKey(transport, chatId)) ?? 0,
+      bindingRevision: this.bindingRevisions.get(bindingKey(transport, chatId, senderId)) ?? 0,
       expiresAt: Date.now() + ttlMs,
       action,
     });
@@ -2068,10 +2303,42 @@ export class MessengerBridge {
     }
   }
 
-  private binding(transport: string, chatId: string): string {
-    const sessionId = this.bindings.get(bindingKey(transport, chatId));
+  private binding(transport: string, chatId: string, senderId: string): string {
+    const sessionId = this.bindings.get(bindingKey(transport, chatId, senderId));
     if (sessionId === undefined) throw new Error('No session selected. Use /resume or /new.');
     return sessionId;
+  }
+
+  private bindingRecipients(sessionId: string): readonly {
+    readonly key: string;
+    readonly transport: string;
+    readonly chatId: string;
+    readonly senderId: string;
+  }[] {
+    const destinations = new Map<string, {
+      readonly key: string;
+      readonly transport: string;
+      readonly chatId: string;
+      readonly senderId: string;
+      readonly updatedAt: string;
+    }>();
+    for (const [key, boundSessionId] of this.bindings) {
+      if (boundSessionId !== sessionId) continue;
+      const identity = bindingIdentity(key);
+      const destination = bindingDestinationKey(identity.transport, identity.chatId);
+      const candidate = {
+        key,
+        ...identity,
+        updatedAt: this.bindingUpdatedAt.get(key) ?? '',
+      };
+      const current = destinations.get(destination);
+      if (
+        current === undefined
+        || current.updatedAt < candidate.updatedAt
+        || (current.updatedAt === candidate.updatedAt && current.key < candidate.key)
+      ) destinations.set(destination, candidate);
+    }
+    return [...destinations.values()];
   }
 
   private async beginProgress(
@@ -2080,7 +2347,7 @@ export class MessengerBridge {
     senderId: string,
     sessionId: string,
   ): Promise<ProgressState> {
-    const key = `${bindingKey(adapter.id, chatId)}:${sessionId}`;
+    const key = progressKey(adapter.id, chatId, sessionId);
     const previous = this.progress.get(key);
     if (previous !== undefined) {
       await previous.ready;
@@ -2140,13 +2407,9 @@ export class MessengerBridge {
   }
 
   private beginProgressForBindings(sessionId: string): void {
-    for (const [key, bound] of this.bindings) {
-      if (bound !== sessionId) continue;
-      const separator = key.indexOf(':');
-      const adapter = this.adapters.get(key.slice(0, separator));
+    for (const { key, transport, chatId, senderId } of this.bindingRecipients(sessionId)) {
+      const adapter = this.adapters.get(transport);
       if (adapter === undefined) continue;
-      const chatId = key.slice(separator + 1);
-      const senderId = this.bindingOperators.get(key) ?? chatId;
       void this.beginProgress(adapter, chatId, senderId, sessionId)
         .catch((error: unknown) => {
           this.ctx.logger.warn(
@@ -2242,10 +2505,11 @@ export class MessengerBridge {
   private async failProgress(
     adapter: MessengerAdapter,
     chatId: string,
+    senderId: string,
     sessionId: string,
     error: unknown,
   ): Promise<void> {
-    const key = `${bindingKey(adapter.id, chatId)}:${sessionId}`;
+    const key = progressKey(adapter.id, chatId, sessionId);
     const state = this.progress.get(key);
     if (state === undefined) {
       await adapter.sendText(chatId, `Could not send the prompt: ${this.errorMessage(error)}`);
@@ -2298,14 +2562,12 @@ export class MessengerBridge {
 
   private async sendToBindings(sessionId: string, text: string): Promise<void> {
     const sends: Promise<unknown>[] = [];
-    for (const [key, boundSessionId] of this.bindings) {
-      if (boundSessionId !== sessionId) continue;
-      const separator = key.indexOf(':');
-      const adapter = this.adapters.get(key.slice(0, separator));
+    for (const { key, transport, chatId } of this.bindingRecipients(sessionId)) {
+      const adapter = this.adapters.get(transport);
       if (adapter !== undefined) sends.push(this.enqueueOutbound(
         key,
         () => adapter.sendText(
-          key.slice(separator + 1),
+          chatId,
           adapter.renderText?.(text) ?? text,
         ),
       ));
