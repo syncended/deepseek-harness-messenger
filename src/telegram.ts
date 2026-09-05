@@ -1,15 +1,24 @@
 import type {
+  InboundImageMessage,
   InboundMessengerMessage,
   InboundVoiceMessage,
   MessengerAdapter,
+  MessengerImage,
   MessengerInlineKeyboard,
   MessengerMessageHandle,
   SendTextOptions,
 } from './types.js';
 
 const TELEGRAM_TEXT_LIMIT = 4_096;
-const TELEGRAM_VOICE_BYTE_LIMIT = 20 * 1024 * 1024;
-const MAX_VOICE_DOWNLOAD_TIMEOUT_MS = 60_000;
+const TELEGRAM_FILE_BYTE_LIMIT = 20 * 1024 * 1024;
+const TELEGRAM_PHOTO_BYTE_LIMIT = 10 * 1024 * 1024;
+const MAX_FILE_DOWNLOAD_TIMEOUT_MS = 60_000;
+const IMAGE_EXTENSIONS = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+} as const;
 const DEFAULT_RETRY_DELAY_MS = 1_000;
 const MAX_RETRY_DELAY_MS = 30_000;
 const POLL_BATCH_LIMIT = 32;
@@ -54,6 +63,9 @@ interface TelegramMessage {
   readonly chat: TelegramChat;
   readonly from?: TelegramUser;
   readonly sender_chat?: unknown;
+  readonly caption?: unknown;
+  readonly photo?: unknown;
+  readonly document?: unknown;
   readonly voice?: {
     readonly file_id: string;
     readonly duration: number;
@@ -437,8 +449,46 @@ function normalizeGroupCommand(
   );
 }
 
-function validVoiceSize(value: unknown): value is number {
+function validFileSize(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function supportedImageMime(value: unknown): value is MessengerImage['mimeType'] {
+  return typeof value === 'string' && Object.hasOwn(IMAGE_EXTENSIONS, value);
+}
+
+function imageFile(value: unknown): InboundImageMessage['image'] | undefined {
+  if (typeof value !== 'object' || value === null || !('file_id' in value)) return undefined;
+  if (typeof value.file_id !== 'string' || value.file_id.trim() === '') return undefined;
+  const size = 'file_size' in value ? value.file_size : undefined;
+  if (size !== undefined && !validFileSize(size)) return undefined;
+  return { fileId: value.file_id, ...(size === undefined ? {} : { sizeBytes: size }) };
+}
+
+function telegramImage(message: TelegramMessage): InboundImageMessage['image'] | undefined {
+  if (message.photo !== undefined) {
+    if (!Array.isArray(message.photo)) return undefined;
+    let largest: InboundImageMessage['image'] | undefined;
+    let largestArea = 0;
+    for (const photo of message.photo) {
+      const file = imageFile(photo);
+      if (file === undefined
+        || !Number.isSafeInteger(photo.width) || photo.width <= 0
+        || !Number.isSafeInteger(photo.height) || photo.height <= 0
+        || !Number.isSafeInteger(photo.width * photo.height)) continue;
+      const area = photo.width * photo.height;
+      if (area > largestArea) {
+        largestArea = area;
+        largest = { ...file, mimeType: 'image/jpeg' };
+      }
+    }
+    return largest;
+  }
+  const document = message.document;
+  const file = imageFile(document);
+  if (file === undefined || typeof document !== 'object' || document === null
+    || !('mime_type' in document) || !supportedImageMime(document.mime_type)) return undefined;
+  return { ...file, mimeType: document.mime_type };
 }
 
 /** Never reflect Telegram URLs, credentials, or raw transport errors. */
@@ -454,6 +504,23 @@ function inboundUpdate(
   botUsername: string | undefined,
 ): InboundMessengerMessage | undefined {
   const message = update.message;
+  // Media captions stay literal, even if a malformed update also has text.
+  if (message !== undefined && (message.photo !== undefined || message.document !== undefined)) {
+    const user = message.from;
+    if (user == null || !Number.isSafeInteger(user.id) || user.id <= 0
+      || user.is_bot === true || message.sender_chat !== undefined
+      || (message.caption !== undefined && typeof message.caption !== 'string')) return undefined;
+    const image = telegramImage(message);
+    if (image === undefined) return undefined;
+    const name = senderName(user);
+    return {
+      kind: 'image', transport: 'telegram',
+      messageId: String(message.message_id), chatId: String(message.chat.id),
+      chatKind: message.chat.type, senderId: String(user.id),
+      ...(name === undefined ? {} : { senderName: name }),
+      text: message.caption ?? '', image,
+    };
+  }
   if (message?.text !== undefined) {
     const name = senderName(message.from);
     return {
@@ -483,7 +550,7 @@ function inboundUpdate(
       || typeof voice.file_id !== 'string' || voice.file_id.trim() === ''
       || typeof voice.duration !== 'number'
       || !Number.isFinite(voice.duration) || voice.duration < 0
-      || (voice.file_size !== undefined && !validVoiceSize(voice.file_size))
+      || (voice.file_size !== undefined && !validFileSize(voice.file_size))
     ) return undefined;
     const name = senderName(user);
     return {
@@ -770,12 +837,55 @@ export class TelegramAdapter implements MessengerAdapter {
     });
   }
 
+  async sendImage(
+    chatId: string,
+    image: MessengerImage,
+    signal?: AbortSignal,
+  ): Promise<MessengerMessageHandle> {
+    if (image == null || !(image.bytes instanceof Uint8Array) || image.bytes.byteLength === 0) {
+      throw new TelegramApiError('sendImage', 'image must contain nonempty bytes');
+    }
+    if (!supportedImageMime(image.mimeType)) {
+      throw new TelegramApiError('sendImage', 'unsupported image MIME type');
+    }
+    if (image.bytes.byteLength > TELEGRAM_FILE_BYTE_LIMIT) {
+      throw new TelegramApiError('sendImage', 'image exceeds 20 MB limit');
+    }
+    const photo = (image.mimeType === 'image/png' || image.mimeType === 'image/jpeg')
+      && image.bytes.byteLength <= TELEGRAM_PHOTO_BYTE_LIMIT;
+    const body = new FormData();
+    body.set('chat_id', chatId);
+    // Copy the exact view into owned bytes; never accept a URL, path, or Telegram file ID.
+    body.set(photo ? 'photo' : 'document', new Blob([new Uint8Array(image.bytes)], {
+      type: image.mimeType,
+    }), `image.${IMAGE_EXTENSIONS[image.mimeType]}`);
+    const operation = photo ? 'sendPhoto' : 'sendDocument';
+    // A failed/aborted send may already have arrived: do not retry or fall back.
+    const sent = await this.call<TelegramSentMessage>(operation, body, signal);
+    if (sent === null || !Number.isSafeInteger(sent.message_id) || sent.message_id <= 0) {
+      throw new TelegramApiError(operation, 'invalid sent message');
+    }
+    return { chatId, messageId: String(sent.message_id) };
+  }
+
   async downloadVoice(message: InboundVoiceMessage, signal: AbortSignal): Promise<Uint8Array> {
-    const operation = 'downloadVoice';
+    return this.downloadFile(message.voice, 'voice', signal);
+  }
+
+  async downloadImage(message: InboundImageMessage, signal: AbortSignal): Promise<Uint8Array> {
+    return this.downloadFile(message.image, 'image', signal);
+  }
+
+  private async downloadFile(
+    metadata: { readonly fileId: string; readonly sizeBytes?: number },
+    kind: 'voice' | 'image',
+    signal: AbortSignal,
+  ): Promise<Uint8Array> {
+    const operation = kind === 'voice' ? 'downloadVoice' : 'downloadImage';
     const configuredTimeout = this.options.requestTimeoutMs;
     const timeout = Number.isFinite(configuredTimeout) && configuredTimeout > 0
-      ? Math.min(Math.floor(configuredTimeout), MAX_VOICE_DOWNLOAD_TIMEOUT_MS)
-      : MAX_VOICE_DOWNLOAD_TIMEOUT_MS;
+      ? Math.min(Math.floor(configuredTimeout), MAX_FILE_DOWNLOAD_TIMEOUT_MS)
+      : MAX_FILE_DOWNLOAD_TIMEOUT_MS;
     const controller = new AbortController();
     const requestSignal = AbortSignal.any([
       signal,
@@ -787,18 +897,21 @@ export class TelegramAdapter implements MessengerAdapter {
     let downloadToken = typeof this.options.token === 'string' ? this.options.token : '';
     const checkSize = (size: unknown): void => {
       if (size === undefined) return;
-      if (!validVoiceSize(size)) throw new TelegramApiError(operation, 'invalid voice size');
-      if (size > TELEGRAM_VOICE_BYTE_LIMIT) {
-        throw new TelegramApiError(operation, 'voice exceeds 20 MB limit');
+      if (!validFileSize(size)) throw new TelegramApiError(operation, `invalid ${kind} size`);
+      if (size > TELEGRAM_FILE_BYTE_LIMIT) {
+        throw new TelegramApiError(operation, `${kind} exceeds 20 MB limit`);
       }
     };
     try {
       requestSignal.throwIfAborted();
-      checkSize(message.voice.sizeBytes);
+      checkSize(metadata.sizeBytes);
+      if (typeof metadata.fileId !== 'string' || metadata.fileId.trim() === '') {
+        throw new TelegramApiError(operation, 'invalid Telegram file ID');
+      }
       const file = await raceWithAbort(this.call<{
         file_path?: unknown;
         file_size?: unknown;
-      }>('getFile', { file_id: message.voice.fileId }, requestSignal), requestSignal);
+      }>('getFile', { file_id: metadata.fileId }, requestSignal), requestSignal);
       checkSize(file.file_size);
       const path = file.file_path;
       // Accept only relative Telegram file paths, never URLs, encoded separators,
@@ -817,7 +930,7 @@ export class TelegramAdapter implements MessengerAdapter {
       if (!response.ok) throw new TelegramApiError(operation, `HTTP ${response.status}`);
       const contentLength = response.headers.get('content-length');
       if (contentLength !== null) checkSize(Number(contentLength));
-      if (response.body === null) throw new TelegramApiError(operation, 'missing voice body');
+      if (response.body === null) throw new TelegramApiError(operation, `missing ${kind} body`);
       reader = response.body.getReader();
       const chunks: Uint8Array[] = [];
       let length = 0;
@@ -829,6 +942,7 @@ export class TelegramAdapter implements MessengerAdapter {
         checkSize(length);
         chunks.push(chunk.value);
       }
+      if (kind === 'image' && length === 0) throw new TelegramApiError(operation, 'empty image body');
       const bytes = new Uint8Array(length);
       let offset = 0;
       for (const chunk of chunks) {
@@ -841,7 +955,7 @@ export class TelegramAdapter implements MessengerAdapter {
       if (error instanceof TelegramApiError) {
         throw new TelegramApiError(operation, safeApiDescription(error.description, downloadToken, 0));
       }
-      throw new TelegramApiError(operation, 'voice request failed');
+      throw new TelegramApiError(operation, `${kind} request failed`);
     } finally {
       controller.abort();
       // Do not let an uncooperative stream delay cancellation or leak its error.
@@ -891,18 +1005,21 @@ export class TelegramAdapter implements MessengerAdapter {
     const requestSignal = AbortSignal.any(signals);
     const token = await this.resolveToken(operation, requestSignal);
 
+    const multipart = body instanceof FormData;
     let response: Response;
     try {
-      response = await this.fetchImpl(
+      requestSignal.throwIfAborted();
+      const pending = this.fetchImpl(
         `https://api.telegram.org/bot${token}/${operation}`,
         {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(body),
+          ...(multipart ? {} : { headers: { 'content-type': 'application/json' } }),
+          body: multipart ? body : JSON.stringify(body),
           signal: requestSignal,
           redirect: 'error',
         },
       );
+      response = await (multipart ? raceWithAbort(pending, requestSignal) : pending);
     } catch {
       throw new TelegramApiError(operation, requestSignal.aborted
         ? 'request aborted or timed out'
@@ -911,8 +1028,11 @@ export class TelegramAdapter implements MessengerAdapter {
 
     let payload: TelegramResponse<T> | undefined;
     try {
-      payload = (await response.json()) as TelegramResponse<T>;
+      const pending = response.json();
+      const parsed: unknown = await (multipart ? raceWithAbort(pending, requestSignal) : pending);
+      if (typeof parsed === 'object' && parsed !== null) payload = parsed as TelegramResponse<T>;
     } catch {
+      if (requestSignal.aborted) throw new TelegramApiError(operation, 'request aborted or timed out');
       // Fall through to the sanitized HTTP error below.
     }
     if (!response.ok || payload === undefined || !payload.ok) {

@@ -52,7 +52,9 @@ describe('Messenger Host settings validation', () => {
     await apply(ctx, initial);
     expect(open).toHaveBeenCalledWith(expect.objectContaining({ name: 'messenger_notifications' }));
     expect(open).toHaveBeenCalledWith(expect.objectContaining({ name: 'messenger_bindings' }));
-    expect(register).toHaveBeenCalledOnce();
+    expect(register).toHaveBeenCalledTimes(2);
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({ name: 'messenger_send_image' }));
+    expect(inject).toEqual(expect.arrayContaining(['fs', 'attachments']));
     expect(close).not.toHaveBeenCalled();
     await Promise.all(disposers.map((dispose) => dispose()));
     expect(close).toHaveBeenCalledOnce();

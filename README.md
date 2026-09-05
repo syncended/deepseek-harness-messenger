@@ -19,6 +19,8 @@ A bridge plugin between [DeepSeek Harness](https://github.com/deepseek-ai/deepse
 - compact dashboards using DSH workspace display names without opaque session hashes;
 - provider-grouped, paginated model selection and compact reasoning controls;
 - interactive `ask_user_question` choices, multi-select, and free-text answers;
+- Telegram photos and image documents as DSH image prompts, including literal captions;
+- outgoing assistant image attachments and an explicit `messenger_send_image` tool for generated files;
 - on-demand local Whisper transcription of Telegram voice messages, with lazy runtime/model installation and full idle unload;
 - context pressure, composition, and cumulative token-usage visibility;
 - follow-up, steering, and turn cancellation controls;
@@ -56,6 +58,30 @@ Telegram group commands addressed as `/command@bot_username` are accepted only w
 
 When DSH calls `ask_user_question`, the bot pauses typing and shows the question with native option buttons. Single-select, multi-select, free-text answers, batched questions, cancellation, reconnect replay, and concurrent pending questions are supported.
 
+## Images
+
+After `/resume` or `/new`, send a Telegram photo or a PNG/JPEG/WebP/GIF document, with or without a caption. The largest photo rendition is downloaded; sending **as a file** avoids Telegram's photo compression. Caption and image enter DSH together as one queued prompt. Captions stay literal: `/cancel` in a caption is not a bot command. Each photo in an album currently becomes a separate prompt, in arrival order; albums are not combined.
+
+Downloads start only for authorized chats/operators with a selected session. Images are limited to **20 MiB** and a bounded download timeout; DSH additionally enforces its configured format, pixel, attachment-size, and model-capability limits. Select an image-capable model with `/model`. Invalid images or unsupported models produce an error, not a text-only prompt with a silently dropped attachment. While `ask_user_question` is pending, answer with text/buttons first, then resend the image.
+
+Incoming images use the canonical DSH attachment store and session history, just like Web uploads. They may be sent to the selected model provider; this is not local-only processing. Telegram also retains the original message under its own policies. Shutdown interrupts downloads, but once DSH prompt admission has begun it may still complete; the bridge drains that accepted action rather than retrying or claiming it was recalled. A stalled Host admission can therefore delay shutdown or live reconfiguration.
+
+### Sending images back
+
+Explicit image blocks in appended assistant messages are mirrored through DSH's session-scoped attachment resolver. Text replies remain separate, with their normal formatting and full-length splitting. At most 10 images per assistant message are mirrored; duplicate message events are suppressed by a bounded process-local cache. Tool results, streamed image chunks, historical replacements, Markdown links, local paths, and remote URLs are **not** automatically uploaded or fetched.
+
+Current DSH model adapters generally produce text, not native image output. For a generated chart, screenshot, or other image file, the top-level agent can call:
+
+```json
+{ "file_path": "output/chart.png" }
+```
+
+using **`messenger_send_image`**. It resolves paths relative to that session's workspace through the DSH filesystem backend, validates the image, and sends it only to currently authorized chats bound to that session—not Host-wide notification subscribers. No model-supplied chat/session IDs are accepted. The tool works with text-only models too; it sends an existing file, it does not generate images itself.
+
+This is an explicit **file export**: only request delivery of images those chat participants may see. In groups, every participant can see the uploaded image. Filesystem read permission alone is not export authorization; DSH sandbox modes can permit reading outside the workspace. No arbitrary-path reading is triggered by an ordinary assistant response.
+
+JPEG/PNG up to 10 MiB use Telegram `sendPhoto`; larger images (up to 20 MiB), GIF, and WebP use `sendDocument` to preserve their format. Telegram's own image-dimension restrictions still apply. Sends are not retried automatically after errors or cancellation because delivery may already have occurred. The tool returns `sent`, `failed`, and `skipped` chat counts, not read receipts. Binding changes during file loading or queued sending prevent stale delivery.
+
 ## Agent notifications
 
 Enable `/notifications on` in an allowed Telegram chat to receive Host-wide status notifications. The `messenger_notify` tool sends a standalone message to all authorized subscribed chats, including from automation sessions without any chat-session binding:
@@ -81,7 +107,7 @@ Raw tool arguments, raw results, file contents, shell output, credentials, and o
 ## Requirements
 
 - Node.js 22 or newer.
-- DeepSeek Harness `0.1.2-rc.1` or a compatible Web profile with the `storageDomain` service (provided by DSH base).
+- DeepSeek Harness `0.1.2-rc.1` or a compatible Web profile with `storageDomain`, `fs`, and `attachments` services (provided by the standard DSH Web profile).
 - A Telegram bot token from [BotFather](https://t.me/BotFather).
 - Outbound DNS and HTTPS access to `api.telegram.org` from the Harness host.
 - pnpm 10 through Corepack only for source development.
@@ -283,7 +309,7 @@ Bindings persist in the `messenger_bindings` storage domain. `NotificationStore`
 ## Roadmap
 
 - Add connection diagnostics and bot identity to the Web GUI.
-- Support attachments, images, files, and additional audio formats beyond voice messages.
+- Combine image albums into one prompt; support general files and additional audio formats beyond voice messages.
 - Add Yandex Messenger and Discord adapters.
 - Add roles and more granular group-chat controls.
 

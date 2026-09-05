@@ -21,6 +21,22 @@ export interface InboundTextMessage extends InboundMessengerBase {
   readonly kind: 'message';
 }
 
+export interface InboundImageMessage extends InboundMessengerBase {
+  readonly kind: 'image';
+  /** Caption is carried in text and is never interpreted as a command. */
+  readonly image: {
+    readonly fileId: string;
+    readonly sizeBytes?: number;
+    readonly mimeType?: string;
+  };
+}
+
+/** Bytes only: adapters never fetch model-supplied URLs or local paths. */
+export interface MessengerImage {
+  readonly bytes: Uint8Array;
+  readonly mimeType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif';
+}
+
 export interface InboundVoiceMessage extends InboundMessengerBase {
   readonly kind: 'voice';
   readonly voice: {
@@ -39,6 +55,7 @@ export interface InboundCallbackInteraction extends InboundMessengerBase {
 
 export type InboundMessengerMessage =
   | InboundTextMessage
+  | InboundImageMessage
   | InboundVoiceMessage
   | InboundCallbackInteraction;
 
@@ -109,6 +126,10 @@ export interface MessengerAdapter {
     showAlert?: boolean,
   ): Promise<void>;
   sendTyping(chatId: string): Promise<void>;
+  /** Download image bytes only after the bridge authorizes the sender and chat. */
+  downloadImage?(message: InboundImageMessage, signal: AbortSignal): Promise<Uint8Array>;
+  /** Upload image bytes; text is sent separately to preserve full-length replies. */
+  sendImage?(chatId: string, image: MessengerImage, signal?: AbortSignal): Promise<MessengerMessageHandle>;
   /** Download voice bytes only after the bridge authorizes the sender and chat. */
   downloadVoice?(message: InboundVoiceMessage, signal: AbortSignal): Promise<Uint8Array>;
 }

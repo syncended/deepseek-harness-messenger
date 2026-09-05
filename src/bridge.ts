@@ -13,6 +13,7 @@ import { DshControl, sessionTitle, visibleAssistantText } from './control.js';
 import { splitTelegramText } from './telegram.js';
 import type { NotificationStore, Subscription } from './notification-store.js';
 import { abortable, type VoiceTranscriber } from './voice.js';
+import { IMAGE_BYTE_LIMIT, MAX_REPLY_IMAGES, messengerImage, visibleAssistantImages } from './images.js';
 import {
   MemoryMessengerBindingStore,
   messengerBindingIdentity,
@@ -23,6 +24,8 @@ import {
 import type {
   InboundCallbackInteraction,
   InboundMessengerMessage,
+  InboundImageMessage,
+  MessengerImage,
   InboundTextMessage,
   InboundVoiceMessage,
   MessengerAdapter,
@@ -175,6 +178,7 @@ interface ProgressState {
   handle?: MessengerMessageHandle;
   ready: Promise<void>;
   text: string;
+  imageCount: number;
   readonly status: string[];
   readonly tools: Map<string, ToolProgress>;
   readonly toolOrder: string[];
@@ -272,6 +276,8 @@ function helpText(): string {
     '/help — show this help',
     '',
     'Any other text is sent to the bound DSH session.',
+    'Photos and PNG/JPEG/WebP/GIF files (up to 20 MiB) are sent with their captions; select an image-capable model.',
+    'Ask the agent to use messenger_send_image to deliver a generated image file back to this chat.',
   ].join('\n');
 }
 
@@ -542,6 +548,9 @@ export class MessengerBridge {
   private readonly notificationStore: NotificationStore | undefined;
   private readonly voice: VoiceTranscriber | undefined;
   private readonly voiceJobs = new Map<string, VoiceJob>();
+  private readonly imageController = new AbortController();
+  private activeImageDownloads = 0;
+  private readonly mirroredImageMessages = new Set<string>();
   private nextThinkingOffset = 0;
   private disposed = false;
 
@@ -643,6 +652,10 @@ export class MessengerBridge {
     }
 
     const key = bindingKey(adapter.id, message.chatId, message.senderId);
+    if (message.kind === 'image') {
+      await this.enqueueAction(key, () => this.handleImage(adapter, message));
+      return;
+    }
     if (message.kind === 'voice') {
       await this.enqueueAction(key, () => this.acceptVoice(adapter, message));
       return;
@@ -656,6 +669,51 @@ export class MessengerBridge {
       return;
     }
     await this.enqueueAction(key, () => this.handleTextMessage(adapter, message));
+  }
+
+  private async handleImage(adapter: MessengerAdapter, message: InboundImageMessage): Promise<void> {
+    const key = bindingKey(adapter.id, message.chatId, message.senderId);
+    const sessionId = this.bindings.get(key);
+    const revision = this.bindingRevisions.get(key);
+    if (sessionId === undefined) {
+      await adapter.sendText(message.chatId, 'No session selected. Use /resume or /new before sending an image.');
+      return;
+    }
+    if (this.pendingQuestions.has(key)) {
+      await adapter.sendText(message.chatId, 'Please answer the pending question with text or buttons, then resend the image.');
+      return;
+    }
+    if (adapter.downloadImage === undefined) {
+      await adapter.sendText(message.chatId, 'Image downloads are unavailable for this messenger.');
+      return;
+    }
+    const size = message.image.sizeBytes;
+    if (size !== undefined && (!Number.isSafeInteger(size) || size <= 0 || size > IMAGE_BYTE_LIMIT)) {
+      await adapter.sendText(message.chatId, 'Images must be nonempty and no larger than 20 MiB.');
+      return;
+    }
+    if (this.activeImageDownloads >= 8) {
+      await adapter.sendText(message.chatId, 'Image downloads are busy. Please try again shortly.');
+      return;
+    }
+    this.activeImageDownloads += 1;
+    const signal = AbortSignal.any([this.imageController.signal, AbortSignal.timeout(60_000)]);
+    try {
+      const image = messengerImage(await abortable(adapter.downloadImage(message, signal), signal));
+      if (this.disposed) return;
+      if (this.bindings.get(key) !== sessionId || this.bindingRevisions.get(key) !== revision || this.pendingQuestions.has(key)) {
+        await adapter.sendText(message.chatId, 'The selected session or question changed. Please resend the image.');
+        return;
+      }
+      // Captions are prompt content, never commands or answers to a text-only question.
+      // The download deadline ends here. Once Host prompt admission starts it
+      // may be noncancelable; disposal drains that accepted action like text prompts.
+      await this.handleUserText(adapter, { ...message, kind: 'message' }, image, this.imageController.signal);
+    } catch {
+      if (!this.disposed) await adapter.sendText(message.chatId, 'Could not load the image. Send a valid PNG, JPEG, WebP, or GIF up to 20 MiB and try again.');
+    } finally {
+      this.activeImageDownloads -= 1;
+    }
   }
 
   private cancelVoice(key: string, jobId?: string): number {
@@ -834,7 +892,7 @@ export class MessengerBridge {
   }
 
   /** Content only: transcripts must never pass through the command parser. */
-  private async handleUserText(adapter: MessengerAdapter, message: InboundTextMessage): Promise<void> {
+  private async handleUserText(adapter: MessengerAdapter, message: InboundTextMessage, image?: MessengerImage, signal?: AbortSignal): Promise<void> {
     const key = bindingKey(message.transport, message.chatId, message.senderId);
     const pendingQuestion = this.pendingQuestions.get(key);
     if (pendingQuestion !== undefined) {
@@ -870,7 +928,7 @@ export class MessengerBridge {
         );
       });
     try {
-      await this.control.prompt(sessionId, message.text, 'queue');
+      await this.control.prompt(sessionId, message.text, 'queue', image, signal);
     } catch (error) {
       if (sharedProgressAlreadyActive) {
         await adapter.sendText(
@@ -901,6 +959,34 @@ export class MessengerBridge {
     }
 
     const active = this.progressStates(sessionId);
+    const images = visibleAssistantImages(event);
+    if (images.length > 0 && this.hasBindings(sessionId) && !this.canSendImage(sessionId)) {
+      await this.sendToBindings(sessionId, 'This messenger cannot deliver image attachments. Open the response in DSH to view them.');
+    }
+    if (images.length > 0 && event.type === 'assistant/message' && this.canSendImage(sessionId)) {
+      const identity = JSON.stringify([sessionId, event.data.message.id]);
+      if (!this.mirroredImageMessages.has(identity)) {
+        this.mirroredImageMessages.add(identity);
+        if (this.mirroredImageMessages.size > 512) this.mirroredImageMessages.delete(this.mirroredImageMessages.values().next().value!);
+        const version = this.imageBindingVersion(sessionId);
+        for (const image of images.slice(0, MAX_REPLY_IMAGES)) {
+          if (this.disposed) return;
+          if (this.imageBindingVersion(sessionId) !== version) break;
+          try {
+            const resolved = await abortable(this.control.image(sessionId, image),
+              AbortSignal.any([this.imageController.signal, AbortSignal.timeout(60_000)]));
+            if (this.disposed || this.imageBindingVersion(sessionId) !== version) continue;
+            const result = await this.sendImage(sessionId, resolved);
+            if (result.failed > 0) await this.sendToBindings(sessionId, 'Could not deliver an image from the response. It may have been partially delivered; it will not be retried automatically.');
+            for (const state of active) state.imageCount += result.sent > 0 ? 1 : 0;
+          } catch {
+            if (!this.disposed) await this.sendToBindings(sessionId, 'Could not load or deliver an image from the response.');
+          }
+        }
+        if (!this.disposed && images.length > MAX_REPLY_IMAGES) await this.sendToBindings(sessionId, `Additional images omitted: limit of ${MAX_REPLY_IMAGES} images per response.`);
+      }
+    }
+    if (this.disposed) return;
     if (active.length === 0) {
       const finalText = visibleAssistantText(event);
       if (finalText !== undefined) await this.sendToBindings(sessionId, finalText);
@@ -1003,6 +1089,40 @@ export class MessengerBridge {
   private notificationRecipients(): Subscription[] {
     return [...this.adapters.keys()].flatMap((transport) => this.notificationStore?.list(transport) ?? [])
       .filter((subscription) => this.authorized(subscription));
+  }
+
+  canSendImage(sessionId: string): boolean {
+    return !this.disposed && this.bindingRecipients(sessionId).some(({ transport }) => this.adapters.get(transport)?.sendImage !== undefined);
+  }
+
+  /** Process-local binding fence for file exports prepared asynchronously. */
+  imageBindingVersion(sessionId: string): string {
+    return JSON.stringify(this.bindingRecipients(sessionId).map(({ key }) => [key, this.bindingRevisions.get(key)]).sort());
+  }
+
+  /** Explicit export to current session bindings, never notification subscribers. */
+  async sendImage(sessionId: string, image: MessengerImage, signal?: AbortSignal): Promise<{ sent: number; failed: number; skipped: number }> {
+    if (!this.canSendImage(sessionId)) throw new Error('No image-capable messenger chat is bound to this session.');
+    const validated = messengerImage(image.bytes);
+    const requestSignal = AbortSignal.any([this.imageController.signal, ...(signal === undefined ? [] : [signal])]);
+    const recipients = this.bindingRecipients(sessionId).map((recipient) => ({
+      ...recipient, revision: this.bindingRevisions.get(recipient.key),
+    }));
+    const results = await Promise.all(recipients.map(({ key, transport, chatId, revision }) => this.enqueueOutbound(
+      progressKey(transport, chatId, sessionId), async (): Promise<'sent' | 'failed' | 'skipped'> => {
+        const adapter = this.adapters.get(transport);
+        if (requestSignal.aborted || this.disposed || this.bindings.get(key) !== sessionId
+          || this.bindingRevisions.get(key) !== revision || adapter?.sendImage === undefined) return 'skipped';
+        try {
+          await adapter.sendImage(chatId, validated, requestSignal);
+          return 'sent';
+        } catch {
+          this.ctx.logger.warn('messenger: image delivery failed; not retrying an uncertain send');
+          return 'failed';
+        }
+      },
+    )));
+    return results.reduce((counts, result) => { counts[result] += 1; return counts; }, { sent: 0, failed: 0, skipped: 0 });
   }
 
   canNotify(sessionId: string): boolean {
@@ -1298,6 +1418,8 @@ export class MessengerBridge {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.imageController.abort();
+    this.mirroredImageMessages.clear();
     for (const job of this.voiceJobs.values()) job.controller.abort(new Error('Messenger bridge disposed.'));
     const disposingVoice = this.voice?.dispose();
     for (const request of this.questionRequests.values()) {
@@ -2552,6 +2674,7 @@ export class MessengerBridge {
       startedAt: Date.now(),
       ready: Promise.resolve(),
       text: '',
+      imageCount: 0,
       status: [],
       tools: new Map(),
       toolOrder: [],
@@ -2666,7 +2789,7 @@ export class MessengerBridge {
     try {
       await state.ready;
       const rawFinalText = state.text.trim();
-      const sourceFinalText = rawFinalText || progressText(state);
+      const sourceFinalText = rawFinalText || (state.imageCount > 0 ? 'Finished.' : progressText(state));
       const finalText = rawFinalText
         ? state.adapter.renderText?.(rawFinalText) ?? rawFinalText
         : sourceFinalText;

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { InboundMessengerMessage, InboundVoiceMessage } from '../src/types.js';
+import type { InboundImageMessage, InboundMessengerMessage, InboundVoiceMessage, MessengerImage } from '../src/types.js';
 import {
   renderTelegramMarkdown,
   splitTelegramHtml,
@@ -50,14 +50,14 @@ const voiceMessage: InboundVoiceMessage = {
 };
 const voiceLimit = 20 * 1024 * 1024;
 
-async function mapVoiceUpdates(messages: object[]): Promise<{
+async function mapVoiceUpdates(messages: object[], botUsername?: string): Promise<{
   received: InboundMessengerMessage[];
   fetchMock: ReturnType<typeof vi.fn<typeof globalThis.fetch>>;
 }> {
   const controller = new AbortController();
   const received: InboundMessengerMessage[] = [];
   const fetchMock = vi.fn<typeof globalThis.fetch>()
-    .mockResolvedValueOnce(jsonResponse(true))
+    .mockResolvedValueOnce(jsonResponse({ username: botUsername }))
     .mockResolvedValueOnce(jsonResponse(true))
     .mockResolvedValueOnce(jsonResponse([
       ...messages.map((message, index) => ({ update_id: index + 1, message })),
@@ -265,6 +265,255 @@ describe('TelegramAdapter voice download', () => {
     expect(serialized).not.toContain('test-token');
     expect(serialized).not.toContain('https://');
     expect(serialized).not.toContain('password');
+  });
+});
+
+const imageMessage: InboundImageMessage = {
+  kind: 'image', transport: 'telegram', chatId: '42', messageId: '8',
+  senderId: '42', text: '', image: { fileId: 'image-id' },
+};
+const imageLimit = 20 * 1024 * 1024;
+
+function rawImage(extra: object = {}): object {
+  return {
+    message_id: 8, chat: { id: 42, type: 'private' },
+    from: { id: 42, username: 'photographer' },
+    photo: [{ file_id: 'image-id', width: 800, height: 600 }],
+    ...extra,
+  };
+}
+
+describe('TelegramAdapter image mapping', () => {
+  it('selects the largest valid resolution, not array order or byte size', async () => {
+    const { received, fetchMock } = await mapVoiceUpdates([rawImage({ photo: [
+      { file_id: 'small', width: 100, height: 100, file_size: 900 },
+      { file_id: 'largest', width: 1024, height: 768, file_size: 300 },
+      { file_id: 'invalid', width: 9999, height: 9999, file_size: -1 },
+      { file_id: 'medium', width: 800, height: 600 },
+    ] })]);
+    expect(received).toEqual([{
+      ...imageMessage, chatKind: 'private', senderName: '@photographer',
+      image: { fileId: 'largest', sizeBytes: 300, mimeType: 'image/jpeg' },
+    }]);
+    expect(fetchMock.mock.calls.every(([url]) => !String(url).includes('getFile'))).toBe(true);
+    expect(JSON.parse(String(fetchMock.mock.calls[3]?.[1]?.body))).toMatchObject({ offset: 3, timeout: 0 });
+  });
+
+  it('retains captions literally, never normalizes commands, and supports captionless album entries', async () => {
+    const caption = '  /new@our_bot\n**literal** <caption>  ';
+    const { received } = await mapVoiceUpdates([
+      rawImage({ caption, text: '/cancel', chat: { id: -7, type: 'supergroup' }, media_group_id: 'album' }),
+      rawImage({ message_id: 9, media_group_id: 'album' }),
+    ], 'our_bot');
+    expect(received.map(({ kind, text }) => ({ kind, text }))).toEqual([
+      { kind: 'image', text: caption }, { kind: 'image', text: '' },
+    ]);
+  });
+
+  it.each(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])('maps %s image documents', async (mimeType) => {
+    const { received } = await mapVoiceUpdates([rawImage({
+      photo: undefined, caption: '/status',
+      document: { file_id: 'document-id', mime_type: mimeType, file_size: 123, file_name: '../../secret' },
+    })]);
+    expect(received[0]).toMatchObject({
+      kind: 'image', text: '/status', image: { fileId: 'document-id', mimeType, sizeBytes: 123 },
+    });
+  });
+
+  it('requires explicit real user identity and never falls back to chat identity', async () => {
+    const { received } = await mapVoiceUpdates([
+      ...[undefined, null, { id: '42' }, { id: 0 }, { id: -42 }, { id: 1.5 }, { id: 42, is_bot: true }]
+        .flatMap((from) => [rawImage({ from }), rawImage({ from, photo: undefined,
+          document: { file_id: 'doc', mime_type: 'image/png' } })]),
+      rawImage({ sender_chat: { id: 42 }, text: '/new' }),
+    ]);
+    expect(received).toEqual([]);
+  });
+
+  it('ignores malformed photos, captions, and unsupported documents', async () => {
+    const { received } = await mapVoiceUpdates([
+      ...[null, {}, [], [null], [{ file_id: '', width: 1, height: 1 }],
+        [{ file_id: 'x', width: 0, height: 1 }], [{ file_id: 'x', width: '1', height: 1 }],
+        [{ file_id: 'x', width: 1.5, height: 1 }], [{ file_id: 'x', width: 1, height: -1 }],
+        [{ file_id: 'x', width: 1, height: 1, file_size: '3' }],
+      ].map((photo) => rawImage({ photo, text: '/new' })),
+      rawImage({ caption: null }), rawImage({ caption: 42 }),
+      ...[null, {}, { file_id: 'x', mime_type: 'image/svg+xml' },
+        { file_id: 'x', mime_type: 'application/pdf' }, { file_id: 'x', mime_type: 'image/png', file_size: -1 },
+        { file_id: ' ', mime_type: 'image/png' }, { file_id: 'x', mime_type: 'toString' },
+      ].map((document) => rawImage({ photo: undefined, document })),
+    ]);
+    expect(received).toEqual([]);
+  });
+});
+
+describe('TelegramAdapter image download', () => {
+  it('downloads via getFile with a fixed host and redirect rejection', async () => {
+    const fetchMock = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(jsonResponse({ file_path: 'photos/file.jpg', file_size: 3 }))
+      .mockResolvedValueOnce(new Response(new Uint8Array([1, 2, 3])));
+    expect(await adapterWith(fetchMock).downloadImage(imageMessage, new AbortController().signal))
+      .toEqual(new Uint8Array([1, 2, 3]));
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({ file_id: 'image-id' });
+    expect(fetchMock.mock.calls[1]?.[0]).toBe('https://api.telegram.org/file/bottest-token/photos/file.jpg');
+    expect(fetchMock.mock.calls.every(([, init]) => init?.redirect === 'error')).toBe(true);
+  });
+
+  it.each(['message', 'getFile', 'content-length', 'stream'])('bounds %s bytes to 20 MiB', async (source) => {
+    const cancel = vi.fn();
+    let count = 0;
+    const fetchMock = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(jsonResponse({ file_path: 'photos/a',
+        ...(source === 'getFile' ? { file_size: imageLimit + 1 } : {}),
+      }))
+      .mockResolvedValueOnce(new Response(new ReadableStream<Uint8Array>({
+        pull(controller) { controller.enqueue(new Uint8Array(count++ < 20 ? 1024 * 1024 : 1)); },
+        cancel,
+      }), { headers: { 'content-length': source === 'content-length' ? String(imageLimit + 1) : '1' } }));
+    const message = source === 'message'
+      ? { ...imageMessage, image: { fileId: 'image-id', sizeBytes: imageLimit + 1 } } : imageMessage;
+    await expect(adapterWith(fetchMock).downloadImage(message, new AbortController().signal)).rejects.toThrow('20 MB');
+    expect(fetchMock).toHaveBeenCalledTimes(source === 'message' ? 0 : source === 'getFile' ? 1 : 2);
+    if (source === 'stream') expect(cancel).toHaveBeenCalled();
+  });
+
+  it.each([
+    '../a', 'photos/../a', '/photos/a', 'https://evil.test/a', '//evil.test/a',
+    'photos/%2f/a', 'photos/%2e%2e/a', 'photos/a?q=x', 'photos/a#x',
+    'photos\\a', 'photos//a', 'photos/./a', '', null,
+  ])('rejects unsafe path %s before any download', async (file_path) => {
+    const fetchMock = vi.fn<typeof globalThis.fetch>().mockResolvedValue(jsonResponse({ file_path }));
+    await expect(adapterWith(fetchMock).downloadImage(imageMessage, new AbortController().signal))
+      .rejects.toThrow('invalid Telegram file path');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([-1, 0.5, '3', null])('rejects malformed size %s', async (file_size) => {
+    const fetchMock = vi.fn<typeof globalThis.fetch>().mockResolvedValue(jsonResponse({ file_path: 'photos/a', file_size }));
+    await expect(adapterWith(fetchMock).downloadImage(imageMessage, new AbortController().signal))
+      .rejects.toThrow('invalid image size');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([0, imageLimit])('validates final body length %s', async (size) => {
+    const fetchMock = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(jsonResponse({ file_path: 'photos/a' }))
+      .mockResolvedValueOnce(new Response(new Uint8Array(size)));
+    const pending = adapterWith(fetchMock).downloadImage(imageMessage, new AbortController().signal);
+    if (size === 0) await expect(pending).rejects.toThrow('empty image body');
+    else expect((await pending).byteLength).toBe(imageLimit);
+  });
+
+  it('rejects redirects without reflecting locations or credentials', async () => {
+    const fetchMock = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(jsonResponse({ file_path: 'photos/a' }))
+      .mockResolvedValueOnce(new Response(null, { status: 302, headers: { location: 'https://evil.test/test-token' } }));
+    await expect(adapterWith(fetchMock).downloadImage(imageMessage, new AbortController().signal))
+      .rejects.toThrow('Telegram downloadImage failed: HTTP 302');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['request', 'runtime', 'timeout'])('cancels stalled image streaming via %s', async (source) => {
+    const request = new AbortController();
+    const runtime = new AbortController();
+    const cancel = vi.fn();
+    const fetchMock = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(jsonResponse({ file_path: 'photos/a' }))
+      .mockResolvedValueOnce(new Response(new ReadableStream<Uint8Array>({ cancel })));
+    const adapter = new TelegramAdapter({ token: 'test-token', pollTimeoutSeconds: 30,
+      requestTimeoutMs: source === 'timeout' ? 20 : 1000, fetch: fetchMock, signal: runtime.signal });
+    const pending = expect(adapter.downloadImage(imageMessage, request.signal)).rejects.toThrow('aborted or timed out');
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    if (source === 'request') request.abort('test-token');
+    if (source === 'runtime') runtime.abort('test-token');
+    await pending;
+    expect(cancel).toHaveBeenCalled();
+  });
+});
+
+describe('TelegramAdapter image upload', () => {
+  it.each([
+    ['image/png', 3, 'sendPhoto', 'photo', 'png'],
+    ['image/jpeg', 10 * 1024 * 1024, 'sendPhoto', 'photo', 'jpg'],
+    ['image/png', 10 * 1024 * 1024 + 1, 'sendDocument', 'document', 'png'],
+    ['image/jpeg', imageLimit, 'sendDocument', 'document', 'jpg'],
+    ['image/webp', 3, 'sendDocument', 'document', 'webp'],
+    ['image/gif', 3, 'sendDocument', 'document', 'gif'],
+  ] as const)('uploads %s (%s bytes) with %s', async (mimeType, size, operation, field, extension) => {
+    const bytes = new Uint8Array(size + 2).fill(7).subarray(1, size + 1);
+    const fetchMock = vi.fn<typeof globalThis.fetch>().mockResolvedValue(jsonResponse({ message_id: 19 }));
+    expect(await adapterWith(fetchMock).sendImage('42', { bytes, mimeType }))
+      .toEqual({ chatId: '42', messageId: '19' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(`https://api.telegram.org/bottest-token/${operation}`);
+    const init = fetchMock.mock.calls[0]?.[1];
+    expect(init).toMatchObject({ method: 'POST', redirect: 'error', signal: expect.any(AbortSignal) });
+    expect(init?.headers).toBeUndefined(); // fetch supplies the multipart boundary.
+    const body = init?.body as FormData;
+    expect(body).toBeInstanceOf(FormData);
+    expect([...body.keys()]).toEqual(['chat_id', field]);
+    expect(body.get('chat_id')).toBe('42');
+    const file = body.get(field) as File;
+    expect(file).toBeInstanceOf(Blob);
+    expect(file.name).toBe(`image.${extension}`);
+    expect(file.type).toBe(mimeType);
+    expect(file.size).toBe(size);
+    expect(Buffer.from(await file.arrayBuffer()).equals(Buffer.from(bytes))).toBe(true);
+  });
+
+  it.each([
+    { bytes: new Uint8Array(), mimeType: 'image/png' },
+    { bytes: new Uint8Array(imageLimit + 1), mimeType: 'image/jpeg' },
+    { bytes: new Uint8Array([1]), mimeType: 'image/svg+xml' },
+    { bytes: new Uint8Array([1]), mimeType: 'toString' },
+    { bytes: 'https://evil.test/a', mimeType: 'image/png' },
+    { bytes: '/tmp/image.png', mimeType: 'image/png' },
+    { bytes: [1, 2], mimeType: 'image/png' },
+    { url: 'https://evil.test/a', mimeType: 'image/png' },
+    null,
+  ])('rejects invalid or non-byte images without requests', async (image) => {
+    const fetchMock = vi.fn<typeof globalThis.fetch>();
+    await expect(adapterWith(fetchMock).sendImage('42', image as unknown as MessengerImage))
+      .rejects.toBeInstanceOf(TelegramApiError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['network', 'api', 'json', 'malformed', 'redirect', 'credential'])('sanitizes %s failure without retry or fallback', async (source) => {
+    const secret = 'test-token https://api.telegram.org/bottest-token/sendPhoto';
+    const fetchMock = vi.fn<typeof globalThis.fetch>(async () => {
+      if (source === 'network') throw new Error(secret);
+      if (source === 'api') return new Response(JSON.stringify({ ok: false,
+        description: secret, error_code: 429, parameters: { retry_after: 1 } }), { status: 429 });
+      if (source === 'json') return new Response(secret, { status: 502 });
+      if (source === 'redirect') return new Response(null, { status: 302, headers: { location: secret } });
+      return jsonResponse(null);
+    });
+    const adapter = new TelegramAdapter({ token: source === 'credential'
+      ? async () => { throw new Error(secret); } : 'test-token',
+    pollTimeoutSeconds: 30, requestTimeoutMs: 1000, fetch: fetchMock });
+    const error: unknown = await adapter.sendImage('42', { bytes: new Uint8Array([1]), mimeType: 'image/png' })
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(TelegramApiError);
+    expect(`${String(error)} ${JSON.stringify(error)}`).not.toContain('test-token');
+    expect(`${String(error)} ${JSON.stringify(error)}`).not.toContain('https://');
+    expect(fetchMock).toHaveBeenCalledTimes(source === 'credential' ? 0 : 1);
+  });
+
+  it.each(['pre-aborted', 'request', 'runtime', 'timeout', 'response-body'])('honors %s cancellation with no uncertain-send retry', async (source) => {
+    const request = new AbortController();
+    const runtime = new AbortController();
+    if (source === 'pre-aborted') request.abort('test-token');
+    const fetchMock = vi.fn<typeof globalThis.fetch>(async () => source === 'response-body'
+      ? new Response(new ReadableStream<Uint8Array>()) : await new Promise<Response>(() => {}));
+    const adapter = new TelegramAdapter({ token: 'test-token', pollTimeoutSeconds: 30,
+      requestTimeoutMs: source === 'timeout' ? 20 : 1000, signal: runtime.signal, fetch: fetchMock });
+    const pending = expect(adapter.sendImage('42', { bytes: new Uint8Array([1]), mimeType: 'image/gif' }, request.signal))
+      .rejects.toThrow('aborted or timed out');
+    if (source !== 'pre-aborted') await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    if (source === 'runtime') runtime.abort('test-token');
+    if (source === 'request' || source === 'response-body') request.abort('test-token');
+    await pending;
+    expect(fetchMock).toHaveBeenCalledTimes(source === 'pre-aborted' ? 0 : 1);
   });
 });
 

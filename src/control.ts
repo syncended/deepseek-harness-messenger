@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { AgentRegistry } from '@deepseek-ai/dsh-agent';
 import type {
+  PromptContentPart,
   ModelCatalogFailure,
   ModelProviderGroup,
   ModelSelection,
@@ -11,6 +12,9 @@ import type {
 import type { PermissionPresetService } from '@deepseek-ai/dsh-permission-presets';
 import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session';
 import type { WorkspaceId, WorkspaceRegistry } from '@deepseek-ai/dsh-workspace';
+import type { AssistantImage } from './images.js';
+import { decodeImage, IMAGE_BYTE_LIMIT } from './images.js';
+import type { MessengerImage } from './types.js';
 
 const NEVER_ABORTED = new AbortController().signal;
 
@@ -169,13 +173,27 @@ export class DshControl {
     return String(created.sessionId);
   }
 
-  async prompt(sessionId: string, text: string, mode: 'queue' | 'steer'): Promise<void> {
+  async prompt(sessionId: string, text: string, mode: 'queue' | 'steer', image?: MessengerImage, signal = NEVER_ABORTED): Promise<void> {
+    const content: PromptContentPart[] = text ? [{ type: 'text', text }] : [];
+    if (image !== undefined) content.push({
+      type: 'image', mediaType: image.mimeType, data: Buffer.from(image.bytes).toString('base64'),
+    });
     await this.ctx.sessionController.prompt({
       requestId: randomUUID() as SessionRequestId,
       sessionId: SessionId(sessionId),
       mode,
-      content: [{ type: 'text', text }],
-    }, NEVER_ABORTED);
+      content,
+    }, signal);
+  }
+
+  async image(sessionId: string, image: AssistantImage): Promise<MessengerImage> {
+    if (!Number.isSafeInteger(image.attachment.bytes) || image.attachment.bytes <= 0 || image.attachment.bytes > IMAGE_BYTE_LIMIT) {
+      throw new Error('Response image exceeds messenger limits.');
+    }
+    const result = await this.ctx.sessionController.attachment({
+      sessionId: SessionId(sessionId), attachmentId: image.attachment.attachmentId,
+    });
+    return decodeImage(result.data);
   }
 
   async models(sessionId: string): Promise<SessionModels> {

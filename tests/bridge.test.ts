@@ -5,9 +5,11 @@ import { NotificationStore, NOTIFICATION_LINK_TTL_MS } from '../src/notification
 import { MemoryMessengerBindingStore } from '../src/store.js';
 import type {
   InboundCallbackInteraction,
+  InboundImageMessage,
   InboundTextMessage,
   InboundVoiceMessage,
   MessengerAdapter,
+  MessengerImage,
   MessengerInlineKeyboard,
   MessengerMessageHandle,
   SendTextOptions,
@@ -2378,6 +2380,365 @@ describe('voice message routing', () => {
       requests[1]!.reject(new Error('Local model unavailable'));
       await vi.waitFor(() => expect(adapter.edits.some((edit) => edit.text.includes('Local model unavailable'))).toBe(true));
       expect(prompt).not.toHaveBeenCalled();
+    } finally { await bridge.dispose(); }
+  });
+});
+
+describe('image message integration', () => {
+  // A real 1x1 PNG; the bridge signature gate and controller base64 handoff use the same bytes.
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=', 'base64');
+  const image: MessengerImage = { bytes: png, mimeType: 'image/png' };
+  const imagePart = { type: 'image', mediaType: 'image/png', data: png.toString('base64') };
+  const attachmentBlock = (id = 'attachment-1') => ({
+    type: 'image', attachment: { attachmentId: id, bytes: png.length, mediaType: 'image/png', width: 1, height: 1 },
+  });
+  function deferred<T>() {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    const promise = new Promise<T>((done) => { resolve = done; });
+    return { promise, resolve };
+  }
+  const photo = (text = '', overrides: Partial<InboundImageMessage> = {}): InboundImageMessage => ({
+    ...message(text), kind: 'image', image: { fileId: 'photo-1', sizeBytes: png.length }, ...overrides,
+  });
+  const assistant = (content: unknown[], id = randomId(), surfaceOp = 'append'): SessionEvent => ({
+    type: 'assistant/message', seq: 1, time: Date.now(), surfaceOp,
+    data: { interrupted: false, message: { id, role: 'assistant', content } },
+  } as unknown as SessionEvent);
+  const finish = (bridge: MessengerBridge) => bridge.onSessionEvent('session-1', {
+    type: 'turn/end', seq: 2, time: Date.now(), data: { turn: 1, reason: { kind: 'completed' } },
+  } as unknown as SessionEvent);
+
+  function setup(notificationStore?: NotificationStore) {
+    const context = fakeContext();
+    const attachment = vi.fn(async (_request: unknown) => ({ data: png.toString('base64'), mediaType: 'image/png' }));
+    Object.assign(context.sessions, { attachment });
+    const adapter = Object.assign(new FakeAdapter(), {
+      downloadImage: vi.fn(async (_message: InboundImageMessage, _signal: AbortSignal): Promise<Uint8Array> => png),
+      sendImage: vi.fn(async (chatId: string, _image: MessengerImage, _signal?: AbortSignal) => ({ chatId, messageId: randomId() })),
+    });
+    const bridge = new MessengerBridge(context.ctx, {
+      allowedChatIds: ['100', '200', '300'], allowedUserIds: ['100', '200', '300', 'second-operator'], privateChatsOnly: false,
+      ...(notificationStore === undefined ? {} : { notificationStore }),
+    });
+    bridge.registerAdapter(adapter);
+    return { ...context, bridge, adapter, attachment };
+  }
+
+  it.each(['Describe this photo', '/new', '/unbind', '/stop'])('routes the authorized bound photo with literal caption %j', async (caption) => {
+    const { bridge, adapter, prompt, sessions } = setup();
+    try {
+      await bridge.handle(message('/resume session-1'));
+      const inbound = photo(caption);
+      await bridge.handle(inbound);
+      expect(adapter.downloadImage).toHaveBeenCalledWith(inbound, expect.any(AbortSignal));
+      expect(prompt).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        sessionId: 'session-1', mode: 'queue', content: [{ type: 'text', text: caption }, imagePart],
+      }), expect.any(AbortSignal));
+      expect(sessions.create).not.toHaveBeenCalled();
+      expect(sessions.cancel).not.toHaveBeenCalled();
+      expect(bridge.canSendImage('session-1')).toBe(true);
+    } finally { await bridge.dispose(); }
+  });
+
+  it('submits captionless photos as image-only prompts', async () => {
+    const { bridge, prompt } = setup();
+    try {
+      await bridge.handle(message('/resume session-1'));
+      await bridge.handle(photo());
+      expect(prompt).toHaveBeenCalledWith(expect.objectContaining({ content: [imagePart] }), expect.any(AbortSignal));
+    } finally { await bridge.dispose(); }
+  });
+
+  it('never downloads unauthorized, unbound, or pending-question photos', async () => {
+    const { bridge, adapter, prompt, respond } = setup();
+    try {
+      await bridge.handle(photo('/resume session-1', { chatId: '999' }));
+      await bridge.handle(photo('Unauthorized sender', { senderId: 'intruder', chatKind: 'group' }));
+      expect(adapter.sent).toEqual([]);
+      await bridge.handle(photo('/resume session-1'));
+      expect(adapter.sent.at(-1)?.text).toContain('No session selected');
+      await bridge.handle(message('/resume session-1'));
+      await bridge.onQuestionRequested('image-question', 'session-1', [{ id: 'q', question: 'Which branch?' }], submitWith(respond, 'image-question'));
+      await bridge.handle(photo('main'));
+      expect(adapter.sent.at(-1)?.text).toContain('pending question');
+      expect(adapter.downloadImage).not.toHaveBeenCalled();
+      expect(prompt).not.toHaveBeenCalled();
+      expect(respond).not.toHaveBeenCalled();
+    } finally { await bridge.dispose(); }
+  });
+
+  it.each([0, -1, 1.5, Number.NaN, 20 * 1024 * 1024 + 1])('rejects bad advertised image size %s before download', async (sizeBytes) => {
+    const { bridge, adapter, prompt } = setup();
+    try {
+      await bridge.handle(message('/resume session-1'));
+      await bridge.handle(photo('', { image: { fileId: 'photo-1', sizeBytes } }));
+      expect(adapter.downloadImage).not.toHaveBeenCalled();
+      expect(prompt).not.toHaveBeenCalled();
+      expect(adapter.sent.at(-1)?.text).toContain('20 MiB');
+    } finally { await bridge.dispose(); }
+  });
+
+  it.each(['empty', 'signature', 'oversized', 'transport'])('rejects %s download failures with sanitized errors', async (failure) => {
+    const { bridge, adapter, prompt } = setup();
+    try {
+      await bridge.handle(message('/resume session-1'));
+      if (failure === 'transport') adapter.downloadImage.mockRejectedValueOnce(new Error('SECRET token https://api.telegram.org/file/botSECRET/private.png'));
+      else adapter.downloadImage.mockResolvedValueOnce(failure === 'empty' ? new Uint8Array() : failure === 'oversized' ? new Uint8Array(20 * 1024 * 1024 + 1) : Buffer.from('SECRET not an image'));
+      await bridge.handle(photo());
+      expect(prompt).not.toHaveBeenCalled();
+      expect(adapter.sent.at(-1)?.text).toContain('Could not load the image');
+      expect(JSON.stringify([adapter.sent, adapter.edits])).not.toContain('SECRET');
+    } finally { await bridge.dispose(); }
+  });
+
+  it('disposal aborts and interrupts a download even when the adapter ignores cancellation', async () => {
+    const { bridge, adapter, prompt } = setup();
+    const entered = deferred<AbortSignal>();
+    const download = deferred<Uint8Array>();
+    adapter.downloadImage.mockImplementationOnce(async (_message, signal) => {
+      entered.resolve(signal);
+      return download.promise;
+    });
+    try {
+      await bridge.handle(message('/resume session-1'));
+      const pending = bridge.handle(photo('Do not submit after disposal'));
+      const signal = await entered.promise;
+      const sentBefore = adapter.sent.length;
+      await bridge.dispose();
+      await pending;
+      expect(signal.aborted).toBe(true);
+      expect(prompt).not.toHaveBeenCalled();
+      expect(adapter.sent).toHaveLength(sentBefore);
+    } finally { download.resolve(png); await bridge.dispose(); }
+  });
+
+  it('surfaces the controller image-support rejection instead of claiming prompt success', async () => {
+    const { bridge, adapter, prompt } = setup();
+    try {
+      await bridge.handle(message('/resume session-1'));
+      prompt.mockRejectedValueOnce(new Error('Selected model does not support image input'));
+      await bridge.handle(photo());
+      expect(prompt).toHaveBeenCalledOnce();
+      expect([...adapter.sent, ...adapter.edits].some(({ text }) => text.includes('Selected model does not support image input'))).toBe(true);
+    } finally { await bridge.dispose(); }
+  });
+
+  it.each([false, true])('resolves native append attachments in the source session and preserves text (active=%s)', async (active) => {
+    const { bridge, adapter, attachment } = setup();
+    try {
+      await bridge.handle(message('/resume session-1'));
+      if (active) await bridge.handle(message('Show me'));
+      adapter.sent.length = 0;
+      const event = assistant([attachmentBlock(), { type: 'text', text: 'The complete final reply.' }], 'native-image');
+      await bridge.onSessionEvent('session-1', event);
+      await bridge.onSessionEvent('session-1', event);
+      expect(attachment).toHaveBeenCalledExactlyOnceWith({ sessionId: 'session-1', attachmentId: 'attachment-1' });
+      expect(adapter.sendImage).toHaveBeenCalledExactlyOnceWith('100', image, expect.any(AbortSignal));
+      if (active) await finish(bridge);
+      await vi.waitFor(() => expect([...adapter.sent, ...adapter.edits].some(({ text }) => text.includes('The complete final reply.'))).toBe(true));
+    } finally { await bridge.dispose(); }
+  });
+
+  it('does not export tool results, chunks, history/nonappend messages, or Markdown paths', async () => {
+    const { bridge, adapter, attachment } = setup();
+    try {
+      await bridge.handle(message('/resume session-1'));
+      const events = [
+        assistant([attachmentBlock()], randomId(), 'replace'),
+        assistant([attachmentBlock()], randomId(), 'none'),
+        { ...assistant([attachmentBlock()]), surfaceOp: undefined },
+        { type: 'tool/result', seq: 2, time: Date.now(), data: { callId: 'call', result: [attachmentBlock()] } },
+        { type: 'assistant/chunk', seq: 3, time: Date.now(), data: { chunk: attachmentBlock() } },
+        assistant([{ type: 'text', text: '![image](/private/output.png)' }]),
+      ];
+      for (const event of events) await bridge.onSessionEvent('session-1', event as unknown as SessionEvent);
+      expect(attachment).not.toHaveBeenCalled();
+      expect(adapter.sendImage).not.toHaveBeenCalled();
+    } finally { await bridge.dispose(); }
+  });
+
+  it.each(['resolve', 'upload'])('preserves final text after an image %s failure and does not retry duplicate events', async (failure) => {
+    const { bridge, adapter, attachment } = setup();
+    try {
+      await bridge.handle(message('/resume session-1'));
+      await bridge.handle(message('Show me'));
+      if (failure === 'resolve') attachment.mockRejectedValueOnce(new Error('SECRET attachment storage path'));
+      else adapter.sendImage.mockRejectedValueOnce(new Error('SECRET Telegram token'));
+      const event = assistant([attachmentBlock(), { type: 'text', text: 'Final text still arrives.' }]);
+      await bridge.onSessionEvent('session-1', event);
+      await bridge.onSessionEvent('session-1', event);
+      await finish(bridge);
+      expect(attachment).toHaveBeenCalledOnce();
+      expect(adapter.sendImage).toHaveBeenCalledTimes(failure === 'resolve' ? 0 : 1);
+      expect(adapter.sent.some(({ text }) => /Could not .*image/.test(text))).toBe(true);
+      await vi.waitFor(() => expect(adapter.edits.at(-1)?.text).toContain('Final text still arrives.'));
+      expect(JSON.stringify([adapter.sent, adapter.edits])).not.toContain('SECRET');
+    } finally { await bridge.dispose(); }
+  });
+
+  it('rejects oversized native attachment metadata before resolver IO while preserving final text', async () => {
+    const { bridge, adapter, attachment } = setup();
+    try {
+      await bridge.handle(message('/resume session-1'));
+      const block = attachmentBlock();
+      block.attachment.bytes = 20 * 1024 * 1024 + 1;
+      await bridge.onSessionEvent('session-1', assistant([block, { type: 'text', text: 'Text without oversized image.' }]));
+      expect(attachment).not.toHaveBeenCalled();
+      expect(adapter.sendImage).not.toHaveBeenCalled();
+      expect(adapter.sent.at(-1)?.text).toBe('Text without oversized image.');
+    } finally { await bridge.dispose(); }
+  });
+
+  it('disposal interrupts native attachment resolution without late images, errors, or final text', async () => {
+    const { bridge, adapter, attachment } = setup();
+    const entered = deferred<void>();
+    const resolved = deferred<{ data: string; mediaType: string }>();
+    attachment.mockImplementationOnce(async () => { entered.resolve(); return resolved.promise; });
+    try {
+      await bridge.handle(message('/resume session-1'));
+      adapter.sent.length = 0;
+      const pending = bridge.onSessionEvent('session-1', assistant([attachmentBlock(), { type: 'text', text: 'Must not arrive after disposal.' }]));
+      await entered.promise;
+      await bridge.dispose();
+      await pending;
+      expect(adapter.sendImage).not.toHaveBeenCalled();
+      expect(adapter.sent).toEqual([]);
+      expect(adapter.edits).toEqual([]);
+    } finally { resolved.resolve({ data: png.toString('base64'), mediaType: 'image/png' }); await bridge.dispose(); }
+  });
+
+  it.each(['add-chat', 'rebind'])('fences the entire native image batch when the first resolver causes %s', async (change) => {
+    const { bridge, adapter, attachment } = setup();
+    try {
+      await bridge.handle(message('/resume session-1'));
+      attachment.mockImplementationOnce(async () => {
+        if (change === 'add-chat') await bridge.handle(message('/resume session-1', '200'));
+        else {
+          await bridge.handle(message('/unbind'));
+          await bridge.handle(message('/resume session-1'));
+        }
+        return { data: png.toString('base64'), mediaType: 'image/png' };
+      });
+      await bridge.onSessionEvent('session-1', assistant([attachmentBlock('first'), attachmentBlock('second')]));
+      expect(attachment).toHaveBeenCalledExactlyOnceWith({ sessionId: 'session-1', attachmentId: 'first' });
+      expect(adapter.sendImage).not.toHaveBeenCalled();
+      expect(bridge.canSendImage('session-1')).toBe(true);
+    } finally { await bridge.dispose(); }
+  });
+
+  it('drains an already-submitted image prompt during disposal without duplicate submission', async () => {
+    const { bridge, prompt } = setup();
+    const entered = deferred<void>();
+    const accepted = deferred<{ accepted: true }>();
+    prompt.mockImplementationOnce(async () => { entered.resolve(); return accepted.promise; });
+    let stopping: Promise<void> | undefined;
+    try {
+      await bridge.handle(message('/resume session-1'));
+      const handling = bridge.handle(photo('Already submitted'));
+      await entered.promise;
+      let disposed = false;
+      stopping = bridge.dispose().then(() => { disposed = true; });
+      await Promise.resolve();
+      expect(disposed).toBe(false);
+      expect(prompt).toHaveBeenCalledOnce();
+      accepted.resolve({ accepted: true });
+      await handling;
+      await stopping;
+      expect(disposed).toBe(true);
+      expect(prompt).toHaveBeenCalledOnce();
+    } finally { accepted.resolve({ accepted: true }); await stopping; await bridge.dispose(); }
+  });
+
+  it('caps native response images at ten while retaining the text', async () => {
+    const { bridge, adapter, attachment } = setup();
+    try {
+      await bridge.handle(message('/resume session-1'));
+      await bridge.onSessionEvent('session-1', assistant([
+        ...Array.from({ length: 12 }, (_, i) => attachmentBlock(`attachment-${i}`)),
+        { type: 'text', text: 'Twelve images were requested.' },
+      ]));
+      expect(attachment).toHaveBeenCalledTimes(10);
+      expect(adapter.sendImage).toHaveBeenCalledTimes(10);
+      expect(adapter.sent.some(({ text }) => text.includes('limit of 10 images'))).toBe(true);
+      expect(adapter.sent.at(-1)?.text).toBe('Twelve images were requested.');
+    } finally { await bridge.dispose(); }
+  });
+
+  it.each([false, true])('delivers an image-only final response without inventing text (active=%s)', async (active) => {
+    const { bridge, adapter } = setup();
+    try {
+      await bridge.handle(message('/resume session-1'));
+      if (active) await bridge.handle(message('Draw this'));
+      adapter.sent.length = 0;
+      await bridge.onSessionEvent('session-1', assistant([attachmentBlock()]));
+      await finish(bridge);
+      expect(adapter.sendImage).toHaveBeenCalledOnce();
+      if (active) await vi.waitFor(() => expect(adapter.edits.at(-1)?.text).toContain('Finished.'));
+      else expect(adapter.sent).toEqual([]);
+    } finally { await bridge.dispose(); }
+  });
+
+  it('exports only to current session bindings, deduplicates shared chats, and ignores notification subscribers', async () => {
+    const store = new NotificationStore({ subscriptions: [], links: [] }, vi.fn(async () => {}));
+    const { bridge, adapter, sessions } = setup(store);
+    try {
+      const original = (await sessions.list()).items[0]!;
+      sessions.list.mockResolvedValue({ items: [original, { ...original, sessionId: 'session-2' }] });
+      await bridge.handle(message('/resume session-1'));
+      await bridge.handle({ ...message('/resume session-1'), senderId: 'second-operator', chatKind: 'group' });
+      await bridge.handle(message('/resume session-2', '200'));
+      await bridge.handle(message('/notifications on', '300'));
+      expect(await bridge.sendImage('session-1', image)).toEqual({ sent: 1, failed: 0, skipped: 0 });
+      expect(adapter.sendImage).toHaveBeenCalledExactlyOnceWith('100', image, expect.any(AbortSignal));
+      await expect(bridge.sendImage('unbound-session', image)).rejects.toThrow('No image-capable messenger chat');
+      expect(adapter.sendImage).toHaveBeenCalledOnce();
+      await bridge.handle(message('/unbind'));
+      expect(bridge.canSendImage('session-1')).toBe(true); // The second operator really was bound.
+      await bridge.handle({ ...message('/unbind'), senderId: 'second-operator', chatKind: 'group' });
+      expect(bridge.canSendImage('session-1')).toBe(false);
+    } finally { await bridge.dispose(); }
+  });
+
+  it.each(['cancel', 'rebind', 'dispose'])('skips queued image exports after %s', async (action) => {
+    const { bridge, adapter } = setup();
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    try {
+      await bridge.handle(message('/resume session-1'));
+      adapter.sendImage.mockImplementationOnce(async (chatId) => {
+        entered.resolve();
+        await release.promise;
+        return { chatId, messageId: 'held-image' };
+      });
+      const first = bridge.sendImage('session-1', image);
+      await entered.promise;
+      const controller = new AbortController();
+      const second = bridge.sendImage('session-1', image, controller.signal);
+      if (action === 'cancel') controller.abort();
+      if (action === 'rebind') {
+        await bridge.handle(message('/unbind'));
+        await bridge.handle(message('/resume session-1'));
+      }
+      const stopping = action === 'dispose' ? bridge.dispose() : undefined;
+      release.resolve();
+      await first;
+      expect(await second).toEqual({ sent: 0, failed: 0, skipped: 1 });
+      expect(adapter.sendImage).toHaveBeenCalledOnce();
+      await stopping;
+    } finally { release.resolve(); await bridge.dispose(); }
+  });
+
+  it('skips already-cancelled exports and reports partial failures without exposing transport errors', async () => {
+    const { bridge, adapter } = setup();
+    try {
+      await bridge.handle(message('/resume session-1'));
+      await bridge.handle(message('/resume session-1', '200'));
+      expect(await bridge.sendImage('session-1', image, AbortSignal.abort())).toEqual({ sent: 0, failed: 0, skipped: 2 });
+      expect(adapter.sendImage).not.toHaveBeenCalled();
+      adapter.sendImage.mockRejectedValueOnce(new Error('SECRET Telegram token'));
+      expect(await bridge.sendImage('session-1', image)).toEqual({ sent: 1, failed: 1, skipped: 0 });
+      expect(adapter.sendImage).toHaveBeenCalledTimes(2);
+      expect(JSON.stringify([adapter.sent, adapter.edits])).not.toContain('SECRET');
     } finally { await bridge.dispose(); }
   });
 });

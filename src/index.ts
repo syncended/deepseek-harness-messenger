@@ -14,6 +14,7 @@ import {
 import { TelegramAdapter } from './telegram.js';
 import { DEFAULT_VOICE_CONFIG, LocalWhisperTranscriber, type VoiceConfig } from './voice.js';
 import { installNotificationTool } from './notifications.js';
+import { installImageTool } from './image-tool.js';
 import { openNotificationStore, type NotificationStore } from './notification-store.js';
 
 export { MessengerBridge, parseCommand } from './bridge.js';
@@ -32,6 +33,8 @@ export type { MessengerBindingRecord, MessengerBindingStore } from './store.js';
 export type {
   InboundMessengerMessage,
   InboundVoiceMessage,
+  InboundImageMessage,
+  MessengerImage,
   MessengerAdapter,
   ParsedCommand,
 } from './types.js';
@@ -46,6 +49,8 @@ export const inject = [
   'settings',
   'tools',
   'storageDomain',
+  'fs',
+  'attachments',
 ];
 export const MESSENGER_SETTINGS_NAMESPACE = 'messenger';
 
@@ -400,10 +405,12 @@ export async function apply(ctx: Context, entryConfig: Config): Promise<void> {
   let notificationStore: NotificationStore;
   try {
     notificationStore = await openNotificationStore(ctx);
-    installNotificationTool(ctx, () => {
+    const activeBridges = () => {
       const bridge = disposed ? undefined : active?.bridge;
       return bridge === undefined ? [] : [bridge];
-    });
+    };
+    installNotificationTool(ctx, activeBridges);
+    installImageTool(ctx, activeBridges);
   } catch (error) {
     await bindingStore.close();
     throw error;
